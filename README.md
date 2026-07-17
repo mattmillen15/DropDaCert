@@ -14,31 +14,13 @@ When you have local admin on a host where a privileged user has an active RDP or
 
 ## Install
 
-### System dependencies (required for pykerberos)
-
-**Kali / Debian / Ubuntu:**
-```bash
-sudo apt install libkrb5-dev
-```
-
-**RHEL / Fedora:**
-```bash
-sudo dnf install krb5-devel
-```
-
-**macOS:**
-```bash
-brew install krb5
-export CFLAGS="-I$(brew --prefix krb5)/include"
-export LDFLAGS="-L$(brew --prefix krb5)/lib"
-```
-
-### Python dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
 > **Note:** If you hit pip conflicts with system packages on Kali, add `--break-system-packages`.
+>
+> Kerberos auth uses pure impacket — no system kerberos libraries (no `libkrb5-dev`, no `pykerberos`) are required.
 
 ---
 
