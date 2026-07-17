@@ -1,0 +1,7 @@
+output/
+*.pfx
+*.ccache
+*.conf
+__pycache__/
+*.pyc
+.DS_Store

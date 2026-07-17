@@ -1,0 +1,6 @@
+impacket>=0.13.0
+pywinrm>=0.4.3
+pykerberos>=1.2.4
+requests-kerberos>=0.15.0
+dnspython>=2.0.0
+ldap3>=2.9.0
