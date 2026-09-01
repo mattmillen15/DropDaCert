@@ -85,6 +85,6 @@ certdrop admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 -tu lowpriv \
 
 ## Credits
 
-- Technique from [NetExec PR #908](https://github.com/Pennyw0rth/NetExec/pull/908) by [@Tw1sm](https://github.com/Tw1sm)
+- Technique from [NetExec PR #908](https://github.com/Pennyw0rth/NetExec/pull/908) by [@Dfte](https://github.com/Dfte)
 - SMB execution via [susinternals](https://github.com/sensepost/susinternals) by [@sensepost](https://github.com/sensepost)
 - Certificate auth via [Certipy](https://github.com/ly4k/Certipy) by [@ly4k](https://github.com/ly4k)
