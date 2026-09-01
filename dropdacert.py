@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-certdrop - ADCS cert theft via scheduled task session hijack
+dropdacert - ADCS cert theft via scheduled task session hijack
 
 Drops a scheduled task that runs in a target user's active session context
 to request an ADCS certificate, export it as PFX, then runs certipy to
 extract the user's NT hash.
 
 Usage:
-  certdrop.py admin:Pass@TARGET -ca HOST\\CA -dc DC_IP
-  certdrop.py admin@TARGET -H :NTHASH -ca HOST\\CA -dc DC_IP
-  certdrop.py domain/admin:Pass@TARGET -ca HOST\\CA -dc DC_IP -k
+  dropdacert.py admin:Pass@TARGET -ca HOST\\CA -dc DC_IP
+  dropdacert.py admin@TARGET -H :NTHASH -ca HOST\\CA -dc DC_IP
+  dropdacert.py domain/admin:Pass@TARGET -ca HOST\\CA -dc DC_IP -k
 """
 
 import argparse
@@ -746,7 +746,7 @@ class SusinternalsExec:
             if p and os.path.isfile(p):
                 return p
         die("psexecsvc.py not found — download from github.com/sensepost/susinternals "
-            "and place alongside certdrop.py")
+            "and place alongside dropdacert.py")
 
     def _build_target_str(self):
         if self.domain:
@@ -1216,7 +1216,7 @@ def main():
 
     if args.exec_method == "manual":
         print()
-        print("  certdrop v2.0")
+        print("  DropDaCert v2.0")
         print()
         run_manual_mode(args)
         return
@@ -1227,7 +1227,7 @@ def main():
         args.password = getpass.getpass(f"  Password for {prompt_user}: ")
 
     print()
-    print("  certdrop v2.0")
+    print("  DropDaCert v2.0")
     print()
 
     # ── Resolve target
@@ -1373,7 +1373,7 @@ def main():
 
 def parse_args():
     p = argparse.ArgumentParser(
-        prog="certdrop",
+        prog="dropdacert",
         description="ADCS cert theft via scheduled task session hijack",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""examples:
