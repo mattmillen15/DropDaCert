@@ -1129,8 +1129,6 @@ def run_certipy_auth(pfx_path, dc_ip, domain, username=None,
 def main():
     args = parse_args()
 
-    if args.kerberos and not args.dc_ip:
-        die("Kerberos auth requires --dc-ip")
     if not args.password and not args.nt_hash and not args.aes_key:
         import getpass
         prompt_user = f"{args.domain}\\{args.username}" if args.domain else args.username
@@ -1268,8 +1266,7 @@ def main():
 
     # Certipy auth
     certipy_domain = ad_domain or args.domain
-    dc = args.dc_ip or ip
-    run_certipy_auth(out_path, dc, certipy_domain, target_user,
+    run_certipy_auth(out_path, args.dc_ip, certipy_domain, target_user,
                      args.ldap_shell, args.out_dir)
 
 
@@ -1296,8 +1293,8 @@ def parse_args():
         help="NT hash for pass-the-hash")
     auth.add_argument("-k", "--kerberos", action="store_true",
         help="Use Kerberos authentication (requires --dc-ip)")
-    auth.add_argument("--dc-ip", default=None,
-        help="Domain controller IP")
+    auth.add_argument("--dc-ip", required=True,
+        help="Domain controller IP (required for certipy auth)")
     auth.add_argument("--aes-key", default="",
         help="AES key for Kerberos (128 or 256 bits hex)")
     auth.add_argument("--port", type=int, default=5985,

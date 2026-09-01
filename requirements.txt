@@ -1,5 +1,6 @@
 impacket>=0.13.0
 pywinrm>=0.4.3
+certipy-ad>=5.0.0
 requests>=2.28.0
 dnspython>=2.0.0
 ldap3>=2.9.0
