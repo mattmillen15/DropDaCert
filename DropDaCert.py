@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-dropdacert - ADCS cert theft via scheduled task session hijack
+DropDaCert - ADCS cert theft via scheduled task session hijack
 
 Drops a scheduled task that runs in a target user's active session context
 to request an ADCS certificate, export it as PFX, then runs certipy to
 extract the user's NT hash.
 
 Usage:
-  dropdacert.py admin:Pass@TARGET -ca HOST\\CA -dc DC_IP
-  dropdacert.py admin@TARGET -H :NTHASH -ca HOST\\CA -dc DC_IP
-  dropdacert.py domain/admin:Pass@TARGET -ca HOST\\CA -dc DC_IP -k
+  DropDaCert.py admin:Pass@TARGET -ca HOST\\CA -dc DC_IP
+  DropDaCert.py admin@TARGET -H :NTHASH -ca HOST\\CA -dc DC_IP
+  DropDaCert.py domain/admin:Pass@TARGET -ca HOST\\CA -dc DC_IP -k
 """
 
 import argparse
@@ -746,7 +746,7 @@ class SusinternalsExec:
             if p and os.path.isfile(p):
                 return p
         die("psexecsvc.py not found — download from github.com/sensepost/susinternals "
-            "and place alongside dropdacert.py")
+            "and place alongside DropDaCert.py")
 
     def _build_target_str(self):
         if self.domain:
@@ -1373,7 +1373,7 @@ def main():
 
 def parse_args():
     p = argparse.ArgumentParser(
-        prog="dropdacert",
+        prog="DropDaCert",
         description="ADCS cert theft via scheduled task session hijack",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""examples:

