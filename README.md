@@ -6,13 +6,14 @@ Drops a scheduled task on a target that runs in an active user's session context
 
 ## Install
 
-```
+```bash
+git clone https://github.com/mattmillen15/certdrop.git && cd certdrop
+python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
+curl -sL https://raw.githubusercontent.com/sensepost/susinternals/main/psexecsvc.py -o psexecsvc.py
 ```
 
-Requires [certipy-ad](https://github.com/ly4k/Certipy) on PATH.
-
-For `--exec-method smb`, place [psexecsvc.py](https://github.com/sensepost/susinternals) alongside `certdrop.py`.
+This installs [certipy](https://github.com/ly4k/Certipy) and [psexecsvc](https://github.com/sensepost/susinternals) (needed for `--exec-method smb`).
 
 ## Usage
 
