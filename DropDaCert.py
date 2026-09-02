@@ -85,12 +85,10 @@ SMIME = FALSE
 PrivateKeyArchive = FALSE
 UserProtected = FALSE
 UseExistingKeySet = FALSE
-ProviderName = "Microsoft RSA SChannel Cryptographic Provider"
-ProviderType = 12
+ProviderName = "Microsoft Strong Cryptographic Provider"
+ProviderType = 1
 RequestType = PKCS10
 KeyUsage = 0xa0
-[EnhancedKeyUsageExtension]
-OID=1.3.6.1.5.5.7.3.2
 [RequestAttributes]
 CertificateTemplate = {template}
 """
