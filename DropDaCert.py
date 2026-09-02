@@ -1336,12 +1336,15 @@ def main():
             msg = STATUS_MESSAGES.get(result, result)
             if result != "TIMEOUT":
                 warn(f"Task failed: {msg}")
-            try:
-                os.makedirs(args.out_dir, exist_ok=True)
-                smb_download(smb, args.drop_dir, f"{args.prefix}.log",
-                             os.path.join(args.out_dir, f"{args.prefix}.log"))
-            except Exception:
-                pass
+            for ext in ("log", "status", "req", "cer"):
+                if smb_file_exists(smb, args.drop_dir, f"{args.prefix}.{ext}"):
+                    info(f"  {args.prefix}.{ext} exists on target")
+                    if ext == "log":
+                        log_text = smb_read_text(smb, args.drop_dir, f"{args.prefix}.log")
+                        if log_text:
+                            warn(f"cert.log contents:\n{log_text}")
+                else:
+                    info(f"  {args.prefix}.{ext} NOT found")
             if not args.no_cleanup:
                 cleanup_remote(transport, smb, args.task_name,
                                args.drop_dir, args.prefix)
