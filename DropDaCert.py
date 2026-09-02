@@ -1585,9 +1585,9 @@ def parse_args():
     exc.add_argument("--exec-method", default="winrm",
         choices=["winrm", "smb", "manual"],
         help="Command execution method: winrm (default), smb (psexecsvc), or manual (generate files only)")
-    exc.add_argument("--exec-wrapper", default="conhost",
+    exc.add_argument("--exec-wrapper", default="cmd",
         choices=list(EXEC_METHODS),
-        help="Bat execution wrapper: conhost|cmd|powershell|wscript (default: conhost)")
+        help="Bat execution wrapper: cmd|conhost|powershell|wscript (default: cmd)")
     exc.add_argument("--download-method", default="smb",
         choices=["smb", "smbclient"],
         help="PFX download method (default: smb)")
