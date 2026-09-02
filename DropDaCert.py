@@ -1611,9 +1611,9 @@ def parse_args():
         help="Target user directly (skip interactive session picker)")
 
     exc = p.add_argument_group("execution")
-    exc.add_argument("--exec-method", default="winrm",
-        choices=["winrm", "smb", "tsch", "manual"],
-        help="Command execution method: winrm (default), smb (psexecsvc), tsch (RPC direct), or manual (generate files only)")
+    exc.add_argument("--exec-method", default="tsch",
+        choices=["tsch", "winrm", "smb", "manual"],
+        help="Command execution method: tsch (default, RPC via port 445), winrm, smb (psexecsvc), or manual (generate files only)")
     exc.add_argument("--exec-wrapper", default="conhost",
         choices=list(EXEC_METHODS),
         help="Bat execution wrapper: conhost|cmd|powershell|wscript (default: conhost)")

