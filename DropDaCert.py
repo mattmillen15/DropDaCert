@@ -1059,12 +1059,25 @@ def find_best_template(domain, dc_ip, username, password, nt_hash,
 
         name_flags = t.get("Certificate Name Flag", 0)
         if isinstance(name_flags, int):
-            # Raw bitmask: SubjectAltRequireEmail=0x04000000, SubjectRequireEmail=0x20000000
+            if not (name_flags & 0x02000000):
+                continue
+            if name_flags & 0x08400000:
+                continue
             has_email = bool(name_flags & 0x24000000)
         elif isinstance(name_flags, list):
-            has_email = any("Email" in str(f) for f in name_flags)
+            flags_str = " ".join(str(f) for f in name_flags)
+            if "Upn" not in flags_str:
+                continue
+            if "Dns" in flags_str:
+                continue
+            has_email = "Email" in flags_str
         else:
-            has_email = "Email" in str(name_flags)
+            flags_str = str(name_flags)
+            if "Upn" not in flags_str:
+                continue
+            if "Dns" in flags_str:
+                continue
+            has_email = "Email" in flags_str
 
         candidates.append({"name": name, "has_email": has_email})
 
