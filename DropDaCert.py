@@ -1195,7 +1195,7 @@ def generate_files(target_user, user_domain, ca_config, template,
     end_boundary = (datetime.now() + timedelta(hours=48)).strftime(
         "%Y-%m-%dT%H:%M:%S.000")
 
-    cn = f"{target_user}@{user_domain.lower()}"
+    cn = target_user
 
     files = {}
     files[f"{prefix}.inf"] = CERT_INF.format(
