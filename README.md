@@ -104,7 +104,7 @@ python3 DropDaCert.py admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 -tu lowpriv
 | `--exec-method` | `winrm` (default), `smb`, `manual` |
 | `--exec-wrapper` | `conhost` (default), `cmd`, `powershell`, `wscript` |
 | `--drop-dir` | Remote drop directory (default: `C:\Windows\Tasks`) |
-| `--template` | Certificate template (default: `User`) |
+| `--template` | Certificate template (default: auto-discover via certipy, falls back to `User`) |
 | `--timeout` | PFX wait timeout in seconds (default: 90) |
 | `--ldap-shell` | LDAP shell via certipy instead of NT hash |
 | `--no-cleanup` | Leave files and task on target |
