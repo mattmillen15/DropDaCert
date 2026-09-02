@@ -1057,10 +1057,14 @@ def find_best_template(domain, dc_ip, username, password, nt_hash,
                    for r in enroll_rights):
             continue
 
-        name_flags = t.get("Certificate Name Flag", [])
-        if isinstance(name_flags, str):
-            name_flags = [name_flags]
-        has_email = any("Email" in f for f in (name_flags or []))
+        name_flags = t.get("Certificate Name Flag", 0)
+        if isinstance(name_flags, int):
+            # Raw bitmask: SubjectAltRequireEmail=0x04000000, SubjectRequireEmail=0x20000000
+            has_email = bool(name_flags & 0x24000000)
+        elif isinstance(name_flags, list):
+            has_email = any("Email" in str(f) for f in name_flags)
+        else:
+            has_email = "Email" in str(name_flags)
 
         candidates.append({"name": name, "has_email": has_email})
 
