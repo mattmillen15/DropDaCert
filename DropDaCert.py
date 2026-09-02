@@ -72,28 +72,28 @@ except ImportError:
 
 CERT_INF = """\
 [Version]
-Signature="$Windows NT$"
+            Signature="$Windows NT$"
 
-[NewRequest]
-Subject = "CN={cn}"
-KeySpec = 1
-KeyLength = 2048
-Exportable = TRUE
-MachineKeySet = FALSE
-SMIME = FALSE
-PrivateKeyArchive = FALSE
-UserProtected = FALSE
-UseExistingKeySet = FALSE
-ProviderName = "Microsoft RSA SChannel Cryptographic Provider"
-ProviderType = 12
-RequestType = PKCS10
-KeyUsage = 0xa0
+            [NewRequest]
+            Subject = "CN={cn}"
+            KeySpec = 1
+            KeyLength = 2048
+            Exportable = TRUE
+            MachineKeySet = FALSE
+            SMIME = FALSE
+            PrivateKeyArchive = FALSE
+            UserProtected = FALSE
+            UseExistingKeySet = FALSE
+            ProviderName = "Microsoft RSA SChannel Cryptographic Provider"
+            ProviderType = 12
+            RequestType = PKCS10
+            KeyUsage = 0xa0
 
-[EnhancedKeyUsageExtension]
-OID=1.3.6.1.5.5.7.3.2
+            [EnhancedKeyUsageExtension]
+            OID=1.3.6.1.5.5.7.3.2
 
-[RequestAttributes]
-CertificateTemplate = {template}
+            [RequestAttributes]
+            CertificateTemplate = {template}
 """
 
 CERT_BAT = """\
