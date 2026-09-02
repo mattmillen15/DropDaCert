@@ -47,10 +47,7 @@ Certipy v5.0.3 - by Oliver Lyak (ly4k)
 git clone https://github.com/mattmillen15/DropDaCert.git && cd DropDaCert
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-curl -sL https://raw.githubusercontent.com/sensepost/susinternals/main/psexecsvc.py -o psexecsvc.py
 ```
-
-This installs [certipy](https://github.com/ly4k/Certipy) and [psexecsvc](https://github.com/sensepost/susinternals) (needed for `--exec-method smb`).
 
 ## Usage
 
@@ -83,9 +80,6 @@ python3 DropDaCert.py corp.local/admin@server01 -k -ca 'CA01\CA' -dc 10.0.0.1
 # WinRM exec (if WinRM is available)
 python3 DropDaCert.py admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 --exec-method winrm
 
-# SMB exec (drops psexecsvc service binary)
-python3 DropDaCert.py admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 --exec-method smb
-
 # Manual mode — generate files and print instructions only
 python3 DropDaCert.py admin@target -ca 'CA01\CA' -dc 10.0.0.1 --exec-method manual -tu jsmith
 
@@ -104,7 +98,7 @@ python3 DropDaCert.py admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 -tu lowpriv
 | `-H [LM:]NT` | NTLM hash |
 | `-k` | Kerberos auth |
 | `--aes-key HEX` | AES key for Kerberos |
-| `--exec-method` | `tsch` (default), `winrm`, `smb`, `manual` |
+| `--exec-method` | `tsch` (default), `winrm`, `manual` |
 | `--exec-wrapper` | `conhost` (default), `cmd`, `powershell`, `wscript` |
 | `--drop-dir` | Remote drop directory (default: `C:\Windows\Tasks`) |
 | `--template` | Certificate template (default: `User`) |
@@ -114,8 +108,8 @@ python3 DropDaCert.py admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 -tu lowpriv
 
 ## How it works
 
-1. Connects via TSCH (default, task scheduler RPC over port 445), WinRM, or SMB (psexecsvc)
-2. Enumerates active sessions (WKSSVC RPC for TSCH, WMI for WinRM/SMB)
+1. Connects via TSCH (default, task scheduler RPC over port 445) or WinRM
+2. Enumerates active sessions (WKSSVC RPC for TSCH, WMI for WinRM)
 3. Uploads `cert.inf` and `cert.bat` via SMB
 4. Creates scheduled task — runs in the target user's session context
 5. `cert.bat` runs `certreq` to enroll, exports PFX with empty password
@@ -126,5 +120,4 @@ python3 DropDaCert.py admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 -tu lowpriv
 ## Credits
 
 - Technique from [NetExec PR #908](https://github.com/Pennyw0rth/NetExec/pull/908) by [@Dfte](https://github.com/Dfte)
-- SMB execution via [susinternals](https://github.com/sensepost/susinternals) by [@sensepost](https://github.com/sensepost)
 - Certificate auth via [Certipy](https://github.com/ly4k/Certipy) by [@ly4k](https://github.com/ly4k)
